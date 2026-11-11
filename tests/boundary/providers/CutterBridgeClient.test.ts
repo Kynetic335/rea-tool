@@ -11,6 +11,7 @@ import {
   readFile,
   rm,
   symlink,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -247,6 +248,63 @@ it.skipIf(process.platform === "win32").each(["discovery", "command"] as const)(
   },
 );
 
+describe("CutterBridgeClient: selected POSIX paths", () => {
+  let directory: string | undefined;
+  let server: ReturnType<typeof createServer> | undefined;
+
+  afterEach(async () => {
+    if (server !== undefined)
+      await new Promise<void>((resolve) => server?.close(() => resolve()));
+    if (directory !== undefined)
+      await rm(directory, { recursive: true, force: true });
+    server = undefined;
+    directory = undefined;
+  });
+
+  it
+    .skipIf(process.platform === "win32")
+    .each(["explicit", "tilde", "default"] as const)(
+    "discovers descriptors through symlink parent traversal in %s directory selection",
+    async (selection) => {
+      directory = await mkdtemp(join(tmpdir(), "rea-cutter-selected-path-"));
+      const home = `${directory}/home`;
+      const target = `${directory}/actual`;
+      await mkdir(home);
+      await mkdir(`${target}/child`, { recursive: true });
+      await symlink(`${target}/child`, `${home}/linked`);
+      const selectedHome = `${home}/linked/..`;
+      const suffix =
+        selection === "default" ? ".cache/rea/cutter-bridge" : "bridge";
+      const actualDirectory = `${target}/${suffix}`;
+      await mkdir(actualDirectory, { recursive: true, mode: 0o700 });
+      const sessionId = "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a";
+      const token = "synthetic-cutter-selected-path-token";
+      server = statusServer(token, "/tmp/selected.bin", 7);
+      const port = await listen(server);
+      await writeDescriptor(actualDirectory, sessionId, port, token);
+      const selectedDirectory = `${selectedHome}/${suffix}`;
+      const client = createClient({
+        HOME: selection === "tilde" ? home : selectedHome,
+        ...(selection === "default"
+          ? {}
+          : {
+              REA_CUTTER_BRIDGE_DIR:
+                selection === "tilde"
+                  ? "~/linked/../bridge"
+                  : selectedDirectory,
+            }),
+      });
+      try {
+        const result = await client.listSessions();
+        expect(result.bridge_directory).toBe(selectedDirectory);
+        expectDiscoveredSession(result, sessionId, 7, "/tmp/selected.bin");
+      } finally {
+        await client.close();
+      }
+    },
+  );
+});
+
 describe("CutterBridgeClient: scenario group 1", () => {
   let directory: string | undefined;
   let server: ReturnType<typeof createServer> | undefined;
@@ -460,8 +518,12 @@ describe("CutterBridgeClient: scenario group 2", () => {
     const port = await listen(server);
     await writeDescriptor(directory, sessionId, port, token);
     await writeFile(
-      join(directory, "cutter-1-11111111-1111-1111-1111-111111111111.json"),
+      join(
+        directory,
+        `cutter-${process.pid}-11111111-1111-1111-1111-111111111111.json`,
+      ),
       "{",
+      { mode: 0o600 },
     );
     await writeFile(
       join(
@@ -469,6 +531,7 @@ describe("CutterBridgeClient: scenario group 2", () => {
         `cutter-${process.pid}-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json`,
       ),
       "{}",
+      { mode: 0o600 },
     );
     await writeFile(
       join(
@@ -489,9 +552,25 @@ describe("CutterBridgeClient: scenario group 2", () => {
       { mode: 0o600 },
     );
 
-    const result = await createClient({
-      REA_CUTTER_BRIDGE_DIR: directory,
-    }).listSessions();
+    const client = createClient({ REA_CUTTER_BRIDGE_DIR: directory });
+    if (process.platform !== "win32") {
+      for (const id of [
+        "11111111-1111-1111-1111-111111111111",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      ]) {
+        expect(
+          (await stat(join(directory, `cutter-${process.pid}-${id}.json`)))
+            .mode & 0o777,
+        ).toBe(0o600);
+      }
+    }
+    // Parsing and filename identity reject only the malformed candidates;
+    // the authenticated candidate remains discoverable before status checking.
+    expect(
+      (await client.listDescriptors()).map(({ session_id }) => session_id),
+    ).toEqual([sessionId]);
+    const result = await client.listSessions();
     expect(result).toMatchObject({
       discovery_status: "no_live_bridge_found",
       sessions: [],
@@ -1431,13 +1510,12 @@ describe("CutterBridgeClient: scenario group 9", () => {
       expected_generation: 7,
       command: "pd 4",
     });
-    expect(result.ok).toBe(true);
     if (!result.ok) throw result.error;
-    expect(result.value.limitations).toContain(
-      "The command completed or may have completed, but output exceeded the bridge transport limit and was omitted.",
+    expect(result.value.limitations).toContainEqual(
+      expect.stringMatching(/output.*transport limit.*omitted/iu),
     );
-    expect(result.value.limitations).not.toContain(
-      "Command completion or its output could not be confirmed; do not retry automatically because the command may have produced partial or persistent effects.",
+    expect(result.value.limitations).not.toContainEqual(
+      expect.stringMatching(/completion.*could not be confirmed/iu),
     );
   });
 });

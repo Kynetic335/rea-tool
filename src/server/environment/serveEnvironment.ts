@@ -1,3 +1,5 @@
+import { StateResponseCleanup } from "./StateResponseCleanup.js";
+import type { HttpHostname } from "../../domain/httpHostname.js";
 import { STATE_INTAKE_LIMIT_BYTES } from "../../application/environment/environmentStateDocument.js";
 import {
   DEFAULT_MAX_REQUEST_BODY_SIZE,
@@ -426,6 +428,8 @@ export interface ServeEnvironmentOptions {
   readonly source: EnvironmentSource;
   readonly host: string;
   readonly port: number;
+  /** Operator-declared Host/Origin names; a non-loopback bind refuses to serve without them. */
+  readonly allowedHosts?: readonly HttpHostname[];
   readonly signal?: AbortSignal;
   /** Served name; defaults to the manifest's environment name. */
   readonly environmentName?: string;
@@ -474,9 +478,14 @@ export const serveEnvironment = async (
   };
   // A state file whose close failed stays owned here: later file reads retry it, and close reports it if it is still open.
   const stateFiles = new ArtifactResourceScope();
+  let responseStateChanged = (): void => undefined;
+  const stateResponses = new StateResponseCleanup(() => responseStateChanged());
   const served = await serveStreamableHttp({
     host,
     port,
+    ...(options.allowedHosts === undefined
+      ? {}
+      : { allowedHosts: options.allowedHosts }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     createMcpServer: () => createEnvironmentMcpServer(name, tools, answer),
     routes: environmentRoutes(
@@ -493,6 +502,7 @@ export const serveEnvironment = async (
             },
             stopping.signal,
             stateFiles,
+            stateResponses,
           ),
     ),
     ...(logger === undefined ? {} : { logger }),
@@ -506,17 +516,25 @@ export const serveEnvironment = async (
   });
   let httpClosePending = false;
   let stateClosePending = false;
+  let responseClosePending = false;
+  let settledSuccessful = false;
   let closing: Promise<void> | undefined;
   const shutdownFailures = new Set<AnalysisError>();
   const owner: EnvironmentShutdownOwner = {
     get cleanupResources() {
       const stateResources = stateFiles.cleanupResources;
+      const responseResources = stateResponses.cleanupResources;
       return [
         ...(httpClosePending ? [served.url] : []),
         ...(stateClosePending
           ? stateResources.length > 0
             ? stateResources
             : ["environment state-file scope"]
+          : []),
+        ...(responseClosePending
+          ? responseResources.length > 0
+            ? responseResources
+            : ["state response cleanup"]
           : []),
       ];
     },
@@ -525,7 +543,7 @@ export const serveEnvironment = async (
       const attempt = (async () => {
         stop();
         const failures: {
-          readonly stage: "http-server" | "state-files";
+          readonly stage: "http-server" | "state-files" | "state-responses";
           readonly cause: unknown;
         }[] = [];
         try {
@@ -541,6 +559,15 @@ export const serveEnvironment = async (
         } catch (cause: unknown) {
           stateClosePending = true;
           failures.push({ stage: "state-files", cause });
+        }
+        try {
+          await stateResponses.close();
+          if (stateResponses.cleanupResources.length > 0)
+            throw new Error("State response cleanup remains pending");
+          responseClosePending = false;
+        } catch (cause: unknown) {
+          responseClosePending = true;
+          failures.push({ stage: "state-responses", cause });
         }
         if (failures.length > 0) {
           retainedEnvironmentShutdowns.add(owner);
@@ -577,6 +604,7 @@ export const serveEnvironment = async (
         retainedEnvironmentShutdowns.delete(owner);
         for (const failure of shutdownFailures) failure.resolveCleanup();
         shutdownFailures.clear();
+        settledSuccessful = true;
       })();
       closing = attempt;
       void attempt.catch(() => {
@@ -584,6 +612,26 @@ export const serveEnvironment = async (
       });
       return attempt;
     },
+  };
+  // A fetcher may hand back a response after an earlier stop completed. Keep
+  // that newly acquired body owned and make a later close observe its outcome.
+  responseStateChanged = () => {
+    if (!stopping.signal.aborted) return;
+    if (stateResponses.cleanupResources.length > 0) {
+      responseClosePending = true;
+      retainedEnvironmentShutdowns.add(owner);
+      if (settledSuccessful) {
+        settledSuccessful = false;
+        closing = undefined;
+      }
+    } else if (
+      shutdownFailures.size === 0 &&
+      !httpClosePending &&
+      !stateClosePending
+    ) {
+      responseClosePending = false;
+      retainedEnvironmentShutdowns.delete(owner);
+    }
   };
   return ok({
     ...served,

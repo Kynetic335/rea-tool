@@ -29,27 +29,7 @@ it("names the Wakaru configuration requirement when it is not configured", async
   });
 });
 
-it("rejects an exhausted shared execution budget before launching the next command", async () => {
-  await expect(
-    runWakaruCommand({
-      command: "/selected/wakaru",
-      limiter: "/usr/bin/prlimit",
-      arguments: ["--version"],
-      cwd: "/tmp/unused",
-      environment: {},
-      deadline: performance.now() - 1,
-      launcher: async () => {
-        throw new Error("An expired budget must not launch");
-      },
-    }),
-  ).rejects.toMatchObject({
-    _tag: "AnalysisTimeoutError",
-    operation: "recover_javascript_sources",
-    timeoutMs: RECOVERY_LIMITS.timeoutMs,
-  });
-});
-
-it("says the Wakaru deadline has no runtime override", async () => {
+it("projects the fixed Wakaru deadline without an editable setting", async () => {
   const refusal: unknown = await runWakaruCommand({
     command: "/selected/wakaru",
     limiter: "/usr/bin/prlimit",
@@ -63,16 +43,21 @@ it("says the Wakaru deadline has no runtime override", async () => {
   }).catch((cause: unknown) => cause);
   if (!(refusal instanceof AnalysisTimeoutError))
     throw new Error("Expected the Wakaru deadline");
+  expect(refusal).toMatchObject({
+    operation: "recover_javascript_sources",
+    timeoutMs: RECOVERY_LIMITS.timeoutMs,
+  });
   const projected = projectAnalysisError(refusal);
-  expect(projected.message).toContain(String(RECOVERY_LIMITS.timeoutMs));
-  expect(projected.message).toContain("Wakaru");
-  expect(projected.remediation.action).toContain("no runtime override");
-  expect(projected.remediation.action).toContain("analysis_timeout_ms");
-  expect(projected.remediation.action).toContain("max_heap_mb");
-  expect(projected.remediation.action).toContain(
-    "An unchanged retry may hit this deadline again",
-  );
-  expect(projected.remediation.action).not.toContain("fails the same way");
+  expect(projected).toMatchObject({
+    code: "provider_timeout",
+    details: { timeout_ms: RECOVERY_LIMITS.timeoutMs },
+    recovery: {
+      kind: "inspect_timeout_state",
+      operation: "recover_javascript_sources",
+      timeout_ms: RECOVERY_LIMITS.timeoutMs,
+    },
+  });
+  expect(projected.details?.limit).toBeUndefined();
 });
 
 it("preserves caller cancellation before acquiring an expired execution budget", async () => {

@@ -1,5 +1,8 @@
 import type { FileHandle } from "node:fs/promises";
-import { RegularFileOperationCancelled } from "../filesystem/RegularFile.js";
+import {
+  RegularFileOperationCancelled,
+  type StableRegularFileDescriptor,
+} from "../filesystem/RegularFile.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import {
   withOwnedFileHandle,
@@ -243,6 +246,17 @@ export const assertArtifactReadActive = (
     });
 };
 
+/** Recognize only the originating caller's cancellation without discarding cleanup ownership. */
+export const artifactReadCancelledBy = (
+  cause: unknown,
+  signal: AbortSignal | undefined,
+): boolean =>
+  signal?.aborted === true &&
+  cause instanceof ArtifactReaderFailure &&
+  cause.reason === "cancelled" &&
+  cause.cleanup === undefined &&
+  Object.is(cause.cancellation?.reason, signal.reason);
+
 /** Admit a regular file without blocking on pipes, retaining failed admission closes. */
 export const withArtifactRegularFile = async <Value>(
   path: string,
@@ -252,7 +266,7 @@ export const withArtifactRegularFile = async <Value>(
     ): void;
   },
   signal: AbortSignal | undefined,
-  operation: (file: FileHandle) => Promise<Value>,
+  operation: (source: StableRegularFileDescriptor) => Promise<Value>,
   symlinks: "follow" | "reject" = "reject",
 ): Promise<Value> => {
   let cleanupLease: AnalysisCleanupLease | undefined;
@@ -272,9 +286,9 @@ export const withArtifactRegularFile = async <Value>(
           });
         },
       },
-      async (file) => {
+      async (source) => {
         assertArtifactReadActive(signal);
-        return await operation(file);
+        return await operation(source);
       },
     );
     return value;
@@ -324,7 +338,8 @@ export const withArtifactFileHandle = async <Value>(
   }
 };
 
-const artifactOperationCause = (cause: unknown): unknown =>
+/** Convert only cancellation produced by the regular-file owner. */
+export const artifactOperationCause = (cause: unknown): unknown =>
   cause instanceof RegularFileOperationCancelled
     ? new ArtifactReaderFailure(
         "cancelled",

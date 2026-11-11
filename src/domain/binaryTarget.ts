@@ -1,27 +1,35 @@
+import {
+  resolveMappedFileOffset,
+  type FileMapping,
+  type ZeroFillMapping,
+} from "./virtualFileMapping.js";
 import type {
-  BinaryArchitecture,
   ElfFamilyMetadata,
   HeaderArchitecture,
   MipsElfMetadata,
   PeCodeViewRecord,
   RiscvElfMetadata,
-  PowerPcElfMetadata,
   UniversalMachOSlice,
+  UniversalMachOSliceIdentity,
 } from "./binaryTargetTypes.js";
 import { err, ok, type Result } from "./result.js";
+import {
+  readPeOptionalHeaderFixedFields,
+  readPeOptionalHeaderDirectory,
+} from "./peOptionalHeader.js";
+import type { PeOptionalHeaderFacts } from "./peMachine.js";
+import { readPeCoffHeader } from "./peCoffHeader.js";
+import { readPeSectionHeader } from "./peSectionHeader.js";
 import { readElfFixedHeader } from "./elfFixedHeader.js";
 import {
   mzWindowsHeaderLayoutLimitation,
   parseMzHeaderEvidence,
+  type MzHeaderEvidence,
   type MzWindowsHeaderSignatureEvidence,
 } from "./dosMz.js";
+import { decodePeMachine, readPeOptionalHeader } from "./peMachine.js";
 import {
-  decodePeMachine,
-  peOptionalHeaderMagic,
-  type PeArchitecture,
-} from "./peMachine.js";
-import {
-  classifyFatContainerIdentity,
+  classifyFatContainerEvidence,
   readFatContainerHeader,
   readMachoHeaderPrefixFacts,
   validateFatSliceIdentity,
@@ -50,7 +58,7 @@ export type ExecutableMetadata =
       readonly format: "elf";
       readonly architecture: "powerpc";
       readonly availableArchitectures: readonly "powerpc"[];
-      readonly powerpc: PowerPcElfMetadata;
+      readonly powerpc: ElfFamilyMetadata;
     }
   | {
       readonly format: "elf";
@@ -74,6 +82,7 @@ export type ExecutableMetadata =
       readonly architecture: HeaderArchitecture;
       readonly availableArchitectures: readonly HeaderArchitecture[];
       readonly universalSlice: UniversalMachOSlice;
+      readonly universalSlices: readonly UniversalMachOSliceIdentity[];
     }
   | {
       readonly format: "pe";
@@ -99,9 +108,7 @@ export const claimsExecutableHeader = (
 ): boolean =>
   (bytes.length >= 4 &&
     (bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) ||
-      [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(
-        bytes.readUInt32BE(0),
-      ))) ||
+      readMachoHeaderPrefixFacts(bytes).format !== null)) ||
   (bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a) ||
   readFatContainerHeader(bytes, fileSize).state !== "not-fat";
 
@@ -123,10 +130,12 @@ export const parseExecutableHeader = (
   )
     return parseElf(bytes, fileSize);
   if (bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a)
-    return parseMz(bytes, fileSize, mzWindowsHeaderSignature);
+    return parseMzExecutableMetadata(
+      bytes,
+      parseMzHeaderEvidence(bytes, fileSize, mzWindowsHeaderSignature),
+    );
   if (bytes.length < 8) return err("truncated or unsupported binary header");
-  const magic = bytes.readUInt32BE(0);
-  if ([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(magic))
+  if (readMachoHeaderPrefixFacts(bytes).format !== null)
     return parseThinMachO(bytes, fileSize);
   const fatHeader =
     fatEvidence?.header ?? readFatContainerHeader(bytes, fileSize);
@@ -145,12 +154,8 @@ const parseThinMachO = (
   const table = readMachoLoadCommandTableHeader(bytes, fileSize);
   if (!table.ok) return table;
   if (table.value === null) return err("unsupported binary format");
-  const identity = readMachoHeaderPrefixFacts(bytes.subarray(0, 12)).identity;
-  if (identity === null) return err("unsupported Mach-O architecture");
-  const architecture =
-    identity.cpuType === CPU_TYPE_ARM64_32
-      ? "arm64_32"
-      : machArchitecture(identity.cpuType);
+  const { identity } = table.value;
+  const architecture = machoBinaryArchitecture(identity.cpuType);
   if (architecture === undefined) return err("unsupported Mach-O architecture");
   const commands = new MachoLoadCommandCursor(table.value);
   while (commands.nextOffset !== null) {
@@ -270,9 +275,14 @@ const parseFatMachO = (
   // family declared more than once, such as arm64 and arm64e, has no
   // provider-neutral choice and is not selected.
   const preferred = fatHostArchitecture(host);
-  const hostSlice = declarations.find(
+  const hostSlices = declarations.filter(
     ({ architecture }) => architecture === preferred,
   );
+  if (hostSlices.length > 1)
+    return err(
+      `FAT binary declares several ${preferred} slices; no slice was selected`,
+    );
+  const hostSlice = hostSlices[0];
   const unambiguous = declarations.filter(
     ({ architecture }) =>
       declarations.filter((other) => other.architecture === architecture)
@@ -300,6 +310,15 @@ const parseFatMachO = (
     architecture: selected.architecture,
     availableArchitectures: declaredFamilies(declarations),
     universalSlice: { offset: selected.offset, size: selected.size },
+    universalSlices:
+      header.state === "parsed"
+        ? header.slices.map(({ offset, size, cpuType, cpuSubtype }) => ({
+            offset,
+            size,
+            cpuType,
+            cpuSubtype,
+          }))
+        : [],
   });
 };
 
@@ -366,21 +385,11 @@ const fatIdentityError = (
     ReturnType<typeof readMachoHeaderPrefixFacts>
   >,
 ): string | null => {
-  const identity = classifyFatContainerIdentity(header, (offset) => {
-    if (sliceHeadersByOffset?.has(offset))
-      return sliceHeadersByOffset.get(offset)?.magic;
-    const slice = header.slices.find(
-      (candidate) => candidate.offset === offset,
-    );
-    if (slice === undefined || offset >= bytes.length) return undefined;
-    const available = Math.max(
-      0,
-      Math.min(slice.size, bytes.length - offset, 12),
-    );
-    return readMachoHeaderPrefixFacts(
-      bytes.subarray(offset, offset + available),
-    ).magic;
-  });
+  const identity = classifyFatContainerEvidence(
+    header,
+    bytes,
+    sliceHeadersByOffset,
+  );
   if (identity.state === "needs-slice-header")
     return "FAT slice identity is outside the bounded prefix";
   if (identity.state === "not-mach-o") return "unsupported binary format";
@@ -394,22 +403,20 @@ const parseElf = (
 ): Result<ExecutableMetadata, string> => {
   const fixedHeader = readElfFixedHeader(bytes, fileSize);
   if (!fixedHeader.ok) return fixedHeader;
-  const { elfClass, byteOrder, architecture } = fixedHeader.value;
-  const little = byteOrder === "little";
-  if (architecture === null) return err("unsupported ELF architecture");
+  const { elfClass, byteOrder, architecture, machine, type, flags } =
+    fixedHeader.value;
+  if (architecture === null)
+    return err(`unsupported ELF architecture: e_machine ${String(machine)}`);
   if (
     architecture === "mips" ||
     architecture === "riscv" ||
     architecture === "powerpc"
   ) {
-    const flagsOffset = elfClass === 32 ? 36 : 48;
     const metadata: ElfFamilyMetadata = {
       elfClass,
-      byteOrder: little ? "little" : "big",
-      type: little ? bytes.readUInt16LE(16) : bytes.readUInt16BE(16),
-      flags: little
-        ? bytes.readUInt32LE(flagsOffset)
-        : bytes.readUInt32BE(flagsOffset),
+      byteOrder,
+      type,
+      flags,
     };
     if (architecture === "powerpc")
       return ok({
@@ -445,12 +452,11 @@ const parseElf = (
   });
 };
 
-const parseMz = (
+/** Select executable metadata from the reader's completed MZ observations. */
+export const parseMzExecutableMetadata = (
   bytes: Buffer,
-  fileSize: number,
-  signatureAtOffset?: MzWindowsHeaderSignatureEvidence,
+  evidence: MzHeaderEvidence,
 ): Result<ExecutableMetadata, string> => {
-  const evidence = parseMzHeaderEvidence(bytes, fileSize, signatureAtOffset);
   const { windowsHeader } = evidence;
   if (
     windowsHeader.state === "header-needed" ||
@@ -474,7 +480,8 @@ const parseMz = (
     if (windowsHeader.signature !== "PE")
       return err("invalid or truncated Windows executable header in MZ image");
     const codeView = parsePeCodeViewFromBuffer(bytes, offset);
-    return parsePeRecord(bytes.subarray(offset), codeView);
+    const parsed = parsePeRecordFacts(bytes.subarray(offset), codeView);
+    return parsed.ok ? ok(parsed.value.metadata) : parsed;
   }
   const parsed = evidence.dos;
   return parsed.ok
@@ -487,44 +494,56 @@ const parseMz = (
 };
 
 /** Parse a bounded PE signature, COFF record, and optional header without I/O. */
-export const parsePeRecord = (
+export const parsePeRecordFacts = (
   record: Buffer,
   codeView: PeCodeViewRecord | undefined,
-): Result<ExecutableMetadata, string> => {
+): Result<
+  {
+    readonly metadata: ExecutableMetadata;
+    readonly optionalHeader: PeOptionalHeaderFacts;
+  },
+  string
+> => {
   if (
     record.length < 24 ||
     record.toString("binary", 0, 4) !== "PE\u0000\u0000"
   )
     return err("invalid or truncated PE header");
-  const machineType = record.readUInt16LE(4);
+  const coff = readPeCoffHeader(record.subarray(4, 24));
+  if (!coff.ok) return err("invalid or truncated PE header");
+  const {
+    machine: machineType,
+    optionalHeaderSize,
+    characteristics,
+  } = coff.value;
   const machine = decodePeMachine(machineType);
   if (machine === undefined)
     return err(
       `unsupported PE architecture (COFF machine 0x${machineType.toString(16).padStart(4, "0")})`,
     );
-  const { architecture } = machine;
-  const optionalHeaderSize = record.readUInt16LE(20);
   if (optionalHeaderSize > 4096 || record.length < 24 + optionalHeaderSize)
     return err("invalid or truncated PE optional header");
   const optionalHeader = record.subarray(24, 24 + optionalHeaderSize);
-  const managed = peManagedStatus(optionalHeader, architecture);
-  if (!managed.ok) return managed;
-  if (machine.nativeOsOverride && !managed.value)
-    return err("unsupported PE architecture");
-  const characteristics = record.readUInt16LE(22);
+  const facts = readPeOptionalHeader(optionalHeader, machineType);
+  if (!facts.ok) return err(facts.error.message);
+  if (facts.value.machine === null) return err("unsupported PE architecture");
+  const { architecture } = facts.value.machine;
   return ok({
-    format: "pe",
-    peMachine: machineType,
-    architecture,
-    availableArchitectures: [architecture],
-    executableRole:
-      (characteristics & 0x0002) === 0
-        ? "non-executable"
-        : (characteristics & 0x2000) === 0
-          ? "application"
-          : "shared-library",
-    managed: managed.value,
-    ...(codeView !== undefined ? { codeView } : {}),
+    optionalHeader: facts.value,
+    metadata: {
+      format: "pe",
+      peMachine: machineType,
+      architecture,
+      availableArchitectures: [architecture],
+      executableRole:
+        (characteristics & 0x0002) === 0
+          ? "non-executable"
+          : (characteristics & 0x2000) === 0
+            ? "application"
+            : "shared-library",
+      managed: facts.value.managed,
+      ...(codeView !== undefined ? { codeView } : {}),
+    },
   });
 };
 
@@ -573,24 +592,17 @@ export const peDebugDirectoryEntry = (
       readonly sizeOfHeaders: number;
     }
   | undefined => {
-  if (optionalHeader.length < 2) return undefined;
-  const magic = optionalHeader.readUInt16LE(0);
-  if (magic !== 0x10b && magic !== 0x20b) return undefined;
-  const directoryOffset = magic === 0x20b ? 112 : 96;
-  const directoryCountOffset = directoryOffset - 4;
-  if (optionalHeader.length < directoryCountOffset + 4) return undefined;
-  const directoryCount = optionalHeader.readUInt32LE(directoryCountOffset);
-  if (directoryCount <= 6) return undefined;
-  const debugEntryOffset = directoryOffset + 6 * 8;
-  if (optionalHeader.length < debugEntryOffset + 8) return undefined;
-  const debugRva = optionalHeader.readUInt32LE(debugEntryOffset);
-  const debugSize = optionalHeader.readUInt32LE(debugEntryOffset + 4);
+  const fixed = readPeOptionalHeaderFixedFields(optionalHeader);
+  if (!fixed.ok) return undefined;
+  const observed = readPeOptionalHeaderDirectory(
+    optionalHeader,
+    fixed.value,
+    6,
+  );
+  if (observed.state !== "present") return undefined;
+  const { address: debugRva, size: debugSize } = observed.directory;
   if (debugRva === 0 || debugSize < 28) return undefined;
-  return {
-    debugRva,
-    debugSize,
-    sizeOfHeaders: optionalHeader.readUInt32LE(60),
-  };
+  return { debugRva, debugSize, sizeOfHeaders: fixed.value.sizeOfHeaders };
 };
 
 /** Translate an RVA to an absolute file offset using the PE section table. */
@@ -601,24 +613,67 @@ export const peRvaToFileOffset = (
   sizeOfHeaders: number,
   size = 1,
 ): number | undefined => {
-  if (rva < sizeOfHeaders && size <= sizeOfHeaders - rva) return rva;
-  for (let i = 0; i < numberOfSections; i++) {
-    const offset = i * 40;
-    if (sectionTable.length < offset + 40) break;
-    const virtualAddress = sectionTable.readUInt32LE(offset + 12);
-    const sizeOfRawData = sectionTable.readUInt32LE(offset + 16);
-    const pointerToRawData = sectionTable.readUInt32LE(offset + 20);
-    if (
-      pointerToRawData > 0 &&
-      rva >= virtualAddress &&
-      rva - virtualAddress < sizeOfRawData &&
-      size <= sizeOfRawData - (rva - virtualAddress)
-    ) {
-      return pointerToRawData + (rva - virtualAddress);
-    }
+  const mappings: FileMapping[] = [
+    { address: 0n, offset: 0, size: sizeOfHeaders },
+  ];
+  const zeroFills: ZeroFillMapping[] = [];
+  for (let index = 0; index < numberOfSections; index += 1) {
+    const offset = index * 40;
+    const parsed = readPeSectionHeader(
+      sectionTable.subarray(offset, offset + 40),
+    );
+    if (!parsed.ok) return undefined;
+    const section = parsed.value;
+    const address = BigInt(section.virtual_address);
+    if (section.raw_size > 0)
+      mappings.push({
+        address,
+        offset: section.offset,
+        size: section.raw_size,
+      });
+    if (section.virtual_size > section.raw_size)
+      zeroFills.push({
+        address: address + BigInt(section.raw_size),
+        size: BigInt(section.virtual_size - section.raw_size),
+      });
   }
-  return undefined;
+  const mapped = resolveMappedFileOffset(
+    mappings,
+    BigInt(rva),
+    size,
+    zeroFills,
+  );
+  return mapped.ok ? mapped.value : undefined;
 };
+
+/** CodeView RVA admission uses the same bounded prefix as target file reads. */
+const PE_CODEVIEW_MAPPING_BYTES = 4096;
+
+/** Interpret complete debug entries once; callers own directory and payload read bounds. */
+export function* peCodeViewDataRanges(
+  directory: Buffer,
+  sectionTable: Buffer,
+  numberOfSections: number,
+  sizeOfHeaders: number,
+): Generator<{ readonly fileOffset: number; readonly declaredSize: number }> {
+  for (let offset = 0; offset + 28 <= directory.length; offset += 28) {
+    if (directory.readUInt32LE(offset + 12) !== 2) continue;
+    const declaredSize = directory.readUInt32LE(offset + 16);
+    if (declaredSize < 16) continue;
+    const rawPointer = directory.readUInt32LE(offset + 24);
+    const fileOffset =
+      rawPointer !== 0
+        ? rawPointer
+        : peRvaToFileOffset(
+            directory.readUInt32LE(offset + 20),
+            sectionTable,
+            numberOfSections,
+            sizeOfHeaders,
+            Math.min(declaredSize, PE_CODEVIEW_MAPPING_BYTES),
+          );
+    if (fileOffset !== undefined) yield { fileOffset, declaredSize };
+  }
+}
 
 /** Parse CodeView metadata from a bounded in-memory PE image buffer. */
 export const parsePeCodeViewFromBuffer = (
@@ -626,8 +681,11 @@ export const parsePeCodeViewFromBuffer = (
   peOffset: number,
 ): PeCodeViewRecord | undefined => {
   if (fileBytes.length < peOffset + 24) return undefined;
-  const numberOfSections = fileBytes.readUInt16LE(peOffset + 6);
-  const optionalHeaderSize = fileBytes.readUInt16LE(peOffset + 20);
+  const coff = readPeCoffHeader(
+    fileBytes.subarray(peOffset + 4, peOffset + 24),
+  );
+  if (!coff.ok) return undefined;
+  const { sectionCount: numberOfSections, optionalHeaderSize } = coff.value;
   if (
     optionalHeaderSize > 4096 ||
     fileBytes.length < peOffset + 24 + optionalHeaderSize
@@ -660,29 +718,16 @@ export const parsePeCodeViewFromBuffer = (
     debugDir.debugSize,
     fileBytes.length - debugFileOffset,
   );
-  const numEntries = Math.floor(maxDebugBytes / 28);
-  for (let j = 0; j < numEntries; j++) {
-    const entryOffset = debugFileOffset + j * 28;
-    const type = fileBytes.readUInt32LE(entryOffset + 12);
-    if (type !== 2) continue; // IMAGE_DEBUG_TYPE_CODEVIEW
-    const sizeOfData = fileBytes.readUInt32LE(entryOffset + 16);
-    let pointerToRawData = fileBytes.readUInt32LE(entryOffset + 24);
-    if (pointerToRawData === 0) {
-      const addressOfRawData = fileBytes.readUInt32LE(entryOffset + 20);
-      const mapped = peRvaToFileOffset(
-        addressOfRawData,
-        sectionTable,
-        numberOfSections,
-        debugDir.sizeOfHeaders,
-        Math.min(sizeOfData, 4096),
-      );
-      if (mapped === undefined) continue;
-      pointerToRawData = mapped;
-    }
-    if (
-      sizeOfData < 16 ||
-      fileBytes.length < pointerToRawData + Math.min(sizeOfData, 24)
-    )
+  for (const {
+    fileOffset: pointerToRawData,
+    declaredSize: sizeOfData,
+  } of peCodeViewDataRanges(
+    fileBytes.subarray(debugFileOffset, debugFileOffset + maxDebugBytes),
+    sectionTable,
+    numberOfSections,
+    debugDir.sizeOfHeaders,
+  )) {
+    if (fileBytes.length < pointerToRawData + Math.min(sizeOfData, 24))
       continue;
     const codeViewData = fileBytes.subarray(
       pointerToRawData,
@@ -694,32 +739,11 @@ export const parsePeCodeViewFromBuffer = (
   return undefined;
 };
 
-const peManagedStatus = (
-  optionalHeader: Buffer,
-  architecture: PeArchitecture,
-): Result<boolean, string> => {
-  if (optionalHeader.length < 2) return err("truncated PE optional header");
-  const magic = optionalHeader.readUInt16LE(0);
-  if (magic !== peOptionalHeaderMagic(architecture))
-    return err("PE optional-header magic does not match its architecture");
-  const directoryOffset = magic === 0x20b ? 112 : 96;
-  const directoryCountOffset = directoryOffset - 4;
-  if (optionalHeader.length < directoryCountOffset + 4)
-    return err("truncated PE optional header");
-  const directoryCount = optionalHeader.readUInt32LE(directoryCountOffset);
-  const requiredBytes = directoryOffset + directoryCount * 8;
-  if (
-    !Number.isSafeInteger(requiredBytes) ||
-    requiredBytes > optionalHeader.length
-  )
-    return err("truncated PE data-directory table");
-  if (directoryCount <= 14) return ok(false);
-  const cliDirectory = directoryOffset + 14 * 8;
-  return ok(
-    optionalHeader.readUInt32LE(cliDirectory) !== 0 ||
-      optionalHeader.readUInt32LE(cliDirectory + 4) !== 0,
-  );
-};
+/** CPU family a Mach-O cpu type names, or undefined when it names none here. */
+export const machoBinaryArchitecture = (
+  cpu: number,
+): HeaderArchitecture | "arm64_32" | undefined =>
+  cpu === CPU_TYPE_ARM64_32 ? "arm64_32" : machArchitecture(cpu);
 
 const machArchitecture = (cpu: number): HeaderArchitecture | undefined => {
   switch (cpu) {

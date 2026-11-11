@@ -2,10 +2,13 @@ import { z } from "zod";
 import { canBorrowParsedJsonSnapshot } from "../immutableJson.js";
 
 import { pwntoolsTimeoutField } from "./nativeDeadlines.js";
+import { pwntoolsProducerLimitsField } from "./pwntoolsResourceLimits.js";
 import { absoluteLocalPathStringSchema } from "../localPath.js";
 import { canonicalBase64Schema } from "../stringPatterns.js";
 
-const unsignedHex = z.string().regex(/^0x(?:0|[1-9a-f][0-9a-f]{0,15})$/);
+const unsignedHex = z
+  .string()
+  .regex(/^0x(?:0|[1-9a-f][0-9a-f]{0,15})$/, { abort: true });
 const index = z.int().nonnegative();
 const scalar = z.union([z.string(), z.int()]);
 const range = z.strictObject({ offset: unsignedHex, bytes: unsignedHex });
@@ -23,6 +26,7 @@ export const inspectBinaryLayoutInputSchema = z.strictObject({
     "Absolute filesystem path to the selected binary",
   ),
   pwntools_timeout_ms: pwntoolsTimeoutField,
+  producer_limits: pwntoolsProducerLimitsField,
 });
 
 /** File and linked-image evidence; numeric ELF values never pass through unsafe JSON numbers. */
@@ -33,11 +37,23 @@ const binaryLayoutObjectSchema = z.strictObject({
     bytes: index,
   }),
   format: z.literal("elf"),
-  architecture: z.strictObject({
-    machine: z.literal("EM_X86_64"),
-    bits: z.literal(64),
-    byte_order: z.literal("little"),
-  }),
+  architecture: z.union([
+    z.strictObject({
+      machine: z.enum(["EM_X86_64", "EM_AARCH64"]),
+      bits: z.literal(64),
+      byte_order: z.literal("little"),
+    }),
+    z.strictObject({
+      machine: z.enum(["EM_386", "EM_ARM"]),
+      bits: z.literal(32),
+      byte_order: z.literal("little"),
+    }),
+    z.strictObject({
+      machine: z.literal("EM_MIPS"),
+      bits: z.literal(32),
+      byte_order: z.enum(["little", "big"]),
+    }),
+  ]),
   image_type: z.enum(["ET_EXEC", "ET_DYN", "ET_REL"]),
   entry_point: z.strictObject({
     reported_value: unsignedHex,
@@ -384,7 +400,9 @@ const validateRelocationReferences = (
       (table?.type === "SHT_SYMTAB" || table?.type === "SHT_DYNSYM");
     const positiveReferenceExists =
       tableExists &&
-      BigInt(table.entry_size) >= 24n &&
+      // Elf32_Sym is 16 bytes; Elf64_Sym is 24.
+      BigInt(table.entry_size) >=
+        (value.architecture.bits === 32 ? 16n : 24n) &&
       BigInt(relocation.symbol_index) <
         BigInt(table.size) / BigInt(table.entry_size) &&
       symbols.has(

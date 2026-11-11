@@ -91,6 +91,44 @@ it("uses hidden ARM64 slices as selectable images while preserving their marker"
   );
 });
 
+it.each([
+  { architecture: "arm64e", expected: ["arm64e", "arm64e.x1"] },
+  { architecture: "arm64", expected: ["arm64", "arm64v8"] },
+  { architecture: "x86_64", expected: [] },
+  {
+    architecture: undefined,
+    expected: ["arm64", "arm64v8", "arm64e", "arm64e.x1"],
+  },
+] as const)(
+  "preserves exact root labels with family filter $architecture",
+  async ({ architecture, expected }) => {
+    const facts = parsed(
+      ...(
+        [
+          [0, "arm64"],
+          [1, "arm64v8"],
+          [2, "arm64e"],
+          [12, "arm64e.x1"],
+        ] as const
+      ).map(([subtype, name]) =>
+        slice({
+          architecture: name,
+          cpu_subtype: subtype,
+          file_type: "execute",
+        }),
+      ),
+    );
+    const trace = await traceDylibLoading(memoryView({ [MAIN]: facts }), {
+      roots: [MAIN],
+      ...(architecture === undefined ? {} : { architecture }),
+    });
+    expect(trace.roots.map((root) => root.architecture)).toEqual(expected);
+    expect(trace.coverage.roots_without_architecture).toEqual(
+      expected.length === 0 ? [MAIN] : [],
+    );
+  },
+);
+
 /** In-memory tree: files are images (or "data"), symlinks map to targets. */
 const memoryView = (
   files: Readonly<Record<string, MachoImageFacts | "data">>,
@@ -184,9 +222,9 @@ it.each(["@loader_path_suffix", "@executable_path_suffix", "@loader_path\n"])(
       }),
       { roots: [MAIN] },
     );
-    expect(edgeFor(trace, MAIN, name).resolution).toEqual({
-      status: "undetermined",
-      image: null,
+    expect(edgeFor(trace, MAIN, name)).toMatchObject({
+      candidates: [{ source: "literal", path: name }],
+      resolution: { status: "undetermined", image: null },
     });
   },
 );
@@ -416,7 +454,7 @@ describe("dyld resolution outcomes: deriving path and weak-load outcomes", () =>
     );
   });
 
-  it("derives unresolved and earlier-candidate findings separately for weak loads", async () => {
+  it("reports earlier-rpath misses under environment uncertainty", async () => {
     const trace = await traceDylibLoading(
       memoryView({
         [MAIN]: executable({
@@ -424,14 +462,7 @@ describe("dyld resolution outcomes: deriving path and weak-load outcomes", () =>
             "@executable_path/../Overrides",
             "@executable_path/../Frameworks",
           ],
-          dependencies: [
-            dependency("@rpath/libfound.dylib"),
-            dependency("@rpath/libgone.dylib", {
-              command: "LC_LOAD_WEAK_DYLIB",
-              weak: true,
-            }),
-            dependency("@rpath/libmissing.dylib"),
-          ],
+          dependencies: [dependency("@rpath/libfound.dylib")],
           dyld_environment: ["DYLD_LIBRARY_PATH=/tmp"],
         }),
         "Contents/Frameworks/libfound.dylib": parsed(slice()),
@@ -897,6 +928,71 @@ describe("loader-relative dylib resolution", () => {
   });
 });
 
+it.each([
+  {
+    rootName: "arm64v8",
+    rootSubtype: 1,
+    dylibName: "arm64",
+    dylibSubtype: 0,
+    outcome: "resolved",
+  },
+  {
+    rootName: "arm64",
+    rootSubtype: 0,
+    dylibName: "arm64v8",
+    dylibSubtype: 1,
+    outcome: "resolved",
+  },
+  {
+    rootName: "arm64e.x1",
+    rootSubtype: 12,
+    dylibName: "arm64e",
+    dylibSubtype: 2,
+    outcome: "architecture-missing",
+  },
+  {
+    rootName: "arm64e",
+    rootSubtype: 2,
+    dylibName: "arm64e.x1",
+    dylibSubtype: 12,
+    outcome: "architecture-missing",
+  },
+  {
+    rootName: "arm64e.x1",
+    rootSubtype: 12,
+    dylibName: "arm64e.x1",
+    dylibSubtype: 12,
+    outcome: "resolved",
+  },
+] as const)(
+  "preserves compatibility from $rootName to $dylibName",
+  async ({ rootName, rootSubtype, dylibName, dylibSubtype, outcome }) => {
+    const library = "Contents/MacOS/libfamily.dylib";
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          architecture: rootName,
+          cpu_subtype: rootSubtype,
+          dependencies: [dependency("@executable_path/libfamily.dylib")],
+        }),
+        [library]: parsed(
+          slice({ architecture: dylibName, cpu_subtype: dylibSubtype }),
+        ),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges).toHaveLength(1);
+    expect(trace.edges[0]).toMatchObject({
+      architecture: rootName,
+      candidates: [expect.objectContaining({ outcome })],
+      resolution:
+        outcome === "resolved"
+          ? { status: "resolved", image: library }
+          : { status: "unresolved", image: null },
+    });
+  },
+);
+
 describe("dyld slice compatibility and coverage", () => {
   it("keeps an unmodeled ARM32 subtype uncertain when matching slices exist", async () => {
     const trace = await traceDylibLoading(
@@ -924,6 +1020,12 @@ describe("dyld slice compatibility and coverage", () => {
       ],
       resolution: { status: "undetermined", image: null },
     });
+    expect(trace.coverage.status).toBe("partial");
+    expect(trace.limitations).toContainEqual(
+      expect.stringContaining(
+        "Contents/MacOS/libarm.dylib have unknown architecture compatibility",
+      ),
+    );
   });
 
   it("lets an x86_64h process load generic x86_64 but not arm64e load arm64", async () => {

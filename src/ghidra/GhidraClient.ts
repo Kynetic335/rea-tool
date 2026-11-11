@@ -1,8 +1,12 @@
+import { ghidraAsciiLiteralCandidate } from "./GhidraLiteralSearch.js";
 import {
   fileSnapshotPartialObservationSchema,
   type FileSnapshotPartialObservation,
 } from "../domain/fileSnapshotObservation.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { z } from "zod";
 import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import type { Socket } from "node:net";
@@ -11,6 +15,7 @@ import type { ProgressReporter } from "../application/ProgressReporter.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { JsonValue } from "../domain/jsonValue.js";
+import type { NativeValueFlowLimits } from "../domain/native/nativeValueFlow.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import {
   providerRetryAction,
@@ -39,7 +44,8 @@ import {
   type ProviderProcessSnapshot,
   ProviderProcessSupervisor,
 } from "../process/ProviderProcess.js";
-import { DEFAULT_GHIDRA_STARTUP_TIMEOUT_MS } from "../config/providerStartupTimeout.js";
+import { DEFAULT_GHIDRA_STARTUP_TIMEOUT_MS } from "../domain/analysisResourceLimits.js";
+import { DEFAULT_BRIDGE_MAX_REQUEST } from "../config/bridgeMaxRequestBytes.js";
 import type {
   GhidraClientOptions,
   GhidraRequestOptions,
@@ -53,6 +59,7 @@ import {
   ghidraFailureOutput,
   GHIDRA_JVM_OOME_MARKER,
   GHIDRA_PROCESS_DIAGNOSTIC_BYTES,
+  type GhidraDiagnosticsScope,
 } from "./GhidraDiagnostics.js";
 import { GhidraLaunchError, type GhidraLaunch } from "./GhidraLauncher.js";
 import { GhidraResponseRouter } from "./GhidraResponseRouter.js";
@@ -107,6 +114,10 @@ import {
 import { GhidraWire } from "./GhidraClientWire.js";
 import { completeGhidraStartupHandshake } from "./GhidraClientStartup.js";
 import { ghidraSessionRoot } from "./GhidraSessionRoot.js";
+import {
+  GhidraCheckpoint,
+  type GhidraPackedProgram,
+} from "./GhidraCheckpoint.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 const SESSION_ROOT = ghidraSessionRoot();
@@ -139,6 +150,11 @@ export class GhidraClient {
   #snapshotPath: string | undefined;
   #memoryCgroupBaseline: LinuxCgroupMemoryState | undefined;
   readonly #fileResources = new ArtifactResourceScope();
+  readonly #checkpoint: GhidraCheckpoint | undefined;
+  #checkpointStaging:
+    | { readonly path: string; readonly disposition: "publish" | "discard" }
+    | undefined;
+  #checkpointRestore: GhidraPackedProgram | undefined;
   readonly #cleanupFailures = new Set<AnalysisError>();
   #targetAdmission: JsonValue | undefined;
   #token: string | undefined;
@@ -157,7 +173,7 @@ export class GhidraClient {
   #startupAttempt: GhidraStartupAttempt | undefined;
   #closePromise: Promise<void> | undefined;
   readonly #failure = bindGhidraSessionFailure(
-    () => this.#diagnostics(),
+    (scope) => this.#diagnostics(scope),
     (value, incomplete) => this.#redactAuthentication(value, incomplete),
   );
   readonly #wire: GhidraWire;
@@ -184,6 +200,10 @@ export class GhidraClient {
       this.#failAll(this.#failure("process", "Ghidra bridge socket closed"));
   };
   constructor(options: GhidraClientOptions) {
+    this.#checkpoint =
+      options.checkpoint === undefined
+        ? undefined
+        : new GhidraCheckpoint(options.checkpoint, this.#fileResources);
     this.#options = {
       ...options,
       startupTimeoutMs:
@@ -199,6 +219,8 @@ export class GhidraClient {
       pending: this.#pending,
       logger: this.#logger,
       failure: this.#failure,
+      bridgeMaxRequestBytes:
+        options.bridgeMaxRequestBytes ?? DEFAULT_BRIDGE_MAX_REQUEST,
     });
     this.#requestQueue = new GhidraRequestQueue(
       async (method, parameters, requestOptions) => {
@@ -368,22 +390,24 @@ export class GhidraClient {
     return this.#parseSessionInfo(result.value);
   }
 
-  /** Execute one admitted operation through the serial per-Program queue. */
+  /** Execute one admitted operation through the serial per-Program queue.
+   * Insensitive literal searches return conservative native candidates; the
+   * inventory adapter owns shared matching and retains these raw source rows.
+   */
   async callTool(
     operation: GhidraOperation,
     parameters: Readonly<Record<string, JsonValue>>,
     options: {
       readonly signal?: AbortSignal;
       readonly progress?: ProgressReporter;
+      readonly decompileTimeoutSeconds?: number | null;
+      readonly decompileMaxPayloadMiB?: number | null;
+      readonly valueFlowLimits?: NativeValueFlowLimits;
     } = {},
   ): Promise<Result<JsonValue, GhidraSessionError>> {
     const started = await this.start(options.signal, options.progress);
     if (!started.ok) return started;
-    return this.#requestQueue.run(
-      operation,
-      parameters,
-      options.signal === undefined ? {} : { signal: options.signal },
-    );
+    return this.#callTool(operation, parameters, options);
   }
 
   /** Dispatch against the connected bridge without invoking startup or retry. */
@@ -393,10 +417,46 @@ export class GhidraClient {
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<Result<JsonValue, GhidraSessionError> | undefined> {
     if (!this.isReady()) return Promise.resolve(undefined);
+    return this.#callTool(operation, parameters, options);
+  }
+
+  async #callTool(
+    operation: GhidraOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options: {
+      readonly signal?: AbortSignal;
+      readonly decompileTimeoutSeconds?: number | null;
+      readonly decompileMaxPayloadMiB?: number | null;
+      readonly valueFlowLimits?: NativeValueFlowLimits;
+    },
+  ): Promise<Result<JsonValue, GhidraSessionError>> {
+    const pattern =
+      (operation === "search_procedures" || operation === "search_strings") &&
+      parameters.mode === "literal" &&
+      parameters.case_sensitive === false &&
+      typeof parameters.pattern === "string"
+        ? parameters.pattern
+        : undefined;
     return this.#requestQueue.run(
       operation,
-      parameters,
-      options.signal === undefined ? {} : { signal: options.signal },
+      pattern !== undefined
+        ? {
+            ...parameters,
+            literal_ascii_candidate: ghidraAsciiLiteralCandidate(pattern),
+          }
+        : parameters,
+      {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.decompileTimeoutSeconds === undefined
+          ? {}
+          : { decompileTimeoutSeconds: options.decompileTimeoutSeconds }),
+        ...(options.valueFlowLimits === undefined
+          ? {}
+          : { valueFlowLimits: options.valueFlowLimits }),
+        ...(options.decompileMaxPayloadMiB === undefined
+          ? {}
+          : { decompileMaxPayloadMiB: options.decompileMaxPayloadMiB }),
+      },
     );
   }
 
@@ -488,6 +548,72 @@ export class GhidraClient {
     );
   }
 
+  /**
+   * Hash the immutable snapshot and each byte range in one streamed pass, so a
+   * DOL section is verified without retaining the whole file in memory.
+   */
+  hashTargetSnapshotRanges(
+    ranges: readonly { readonly start: number; readonly end: number }[],
+    signal?: AbortSignal,
+  ): Promise<
+    Result<
+      {
+        readonly sha256: string;
+        readonly bytes: number;
+        readonly rangeSha256: readonly string[];
+      },
+      GhidraSessionError
+    >
+  > {
+    return this.#withTargetSnapshot(
+      async (handle, initial, path) => {
+        for (const range of ranges)
+          if (
+            !Number.isSafeInteger(range.start) ||
+            !Number.isSafeInteger(range.end) ||
+            range.start < 0 ||
+            range.end < range.start ||
+            range.end > initial.size
+          )
+            throw new RangeError("Snapshot range must lie within the target");
+        const hash = createHash("sha256");
+        const rangeHashes = ranges.map(() => createHash("sha256"));
+        let position = 0;
+        for await (const chunk of readArtifactFileChunks(handle, {
+          end: initial.size,
+          signal,
+        })) {
+          const chunkEnd = position + chunk.length;
+          if (chunkEnd > initial.size) throw new RegularFileChangedError(path);
+          hash.update(chunk);
+          ranges.forEach((range, index) => {
+            const start = Math.max(range.start, position);
+            const end = Math.min(range.end, chunkEnd);
+            if (start < end)
+              rangeHashes[index]?.update(
+                chunk.subarray(start - position, end - position),
+              );
+          });
+          position = chunkEnd;
+        }
+        if (position !== initial.size) throw new RegularFileChangedError(path);
+        return {
+          sha256: hash.digest("hex"),
+          bytes: position,
+          rangeSha256: rangeHashes.map((rangeHash) => rangeHash.digest("hex")),
+        };
+      },
+      (value, path) =>
+        fileSnapshotPartialObservationSchema.parse({
+          kind: "file-snapshot-hash",
+          path,
+          sha256: value.sha256,
+          bytes: value.bytes,
+        }),
+      signal,
+    );
+  }
+
   /** Compare MZ source identity without retaining unbounded appended overlays. */
   attestDosTargetSnapshot(
     observations: NativeLoadImageObservation,
@@ -547,8 +673,7 @@ export class GhidraClient {
             path,
             this.#fileResources,
             signal,
-            async (handle) => {
-              const initial = await handle.stat();
+            async ({ handle, initial }) => {
               assertRegularFileActive(signal);
               if (!Number.isSafeInteger(initial.size) || initial.size < 0)
                 throw new RangeError("Snapshot size must be a safe integer");
@@ -625,6 +750,13 @@ export class GhidraClient {
     }
   }
 
+  /** Verified source after startup: null for initial checkpointed analysis; undefined if disabled or unconfirmed. */
+  checkpointRestore(): GhidraPackedProgram | null | undefined {
+    if (this.#checkpoint === undefined || !this.#startupSucceeded())
+      return undefined;
+    return this.#checkpointRestore ?? null;
+  }
+
   /** Read completion from the current attempt; no independent readiness flag. */
   #startupSucceeded(): boolean {
     const startup = this.#startupAttempt?.settlement;
@@ -653,6 +785,7 @@ export class GhidraClient {
           ? (cause.cleanup?.resources ?? [])
           : []),
         ...this.#fileResources.cleanupResources,
+        ...(this.#checkpoint?.cleanupResources ?? []),
         ...[this.#runtimeRoot, this.#socketRoot].flatMap((root) =>
           root === undefined ? [] : [root.path],
         ),
@@ -729,6 +862,7 @@ export class GhidraClient {
         return [
           ...(client.#process === undefined ? [] : ["ghidra-process"]),
           ...client.#fileResources.cleanupResources,
+          ...(client.#checkpoint?.cleanupResources ?? []),
           ...[client.#runtimeRoot, client.#socketRoot].flatMap((root) =>
             root === undefined ? [] : [root.path],
           ),
@@ -784,13 +918,13 @@ export class GhidraClient {
     this.#outputDrainPromise = undefined;
     this.#outputDrainIncomplete = false;
     const deadline = new ProviderStartupDeadline(
-      this.#options.startupTimeoutMs,
+      this.#options.readStartupTimeoutMs?.() ?? this.#options.startupTimeoutMs,
       signal,
     );
     try {
       const result = await this.#startWithin(deadline);
       return result.ok && deadline.signal.aborted
-        ? this.#startupInterrupted(deadline)
+        ? await this.#startupInterrupted(deadline)
         : result;
     } catch (cause: unknown) {
       if (cause instanceof GhidraSessionError) return err(cause);
@@ -808,13 +942,35 @@ export class GhidraClient {
       this.#socket !== undefined ||
       this.#runtimeRoot !== undefined ||
       this.#socketRoot !== undefined ||
-      this.#fileResources.hasPending
+      this.#fileResources.hasPending ||
+      this.#checkpoint?.hasResources === true
     );
   }
 
   async #startWithin(
     deadline: ProviderStartupDeadline,
   ): Promise<GhidraStartResult> {
+    let packedProgram: GhidraPackedProgram | undefined;
+    try {
+      packedProgram = await this.#checkpoint?.acquire(
+        this.#options.runId ?? randomUUID(),
+        deadline.signal,
+      );
+      this.#checkpointRestore = packedProgram;
+    } catch (cause: unknown) {
+      return this.#startupFailure(
+        deadline.signal.aborted
+          ? this.#interruptionFailure(deadline, cause)
+          : this.#failure(
+              "checkpoint",
+              cause instanceof Error
+                ? cause.message
+                : "Ghidra checkpoint admission failed",
+              cause,
+            ),
+        deadline,
+      );
+    }
     try {
       this.#runtimeRoot = await PrivateRuntimeRoot.create({
         parent: SESSION_ROOT,
@@ -822,8 +978,9 @@ export class GhidraClient {
         platform: this.#options.platform,
       });
     } catch (cause: unknown) {
-      return err(
+      return this.#startupFailure(
         this.#failure("start", "Ghidra runtime root creation failed", cause),
+        deadline,
       );
     }
     if (deadline.signal.aborted) return this.#startupInterrupted(deadline);
@@ -892,6 +1049,7 @@ export class GhidraClient {
           targetSha256: this.#options.targetSha256,
           providerVersion: this.#options.providerVersion,
           profileDigest: this.#options.profileDigest,
+          ...(packedProgram === undefined ? {} : { packedProgram }),
         },
         { signal: deadline.signal, resourceScope: this.#fileResources },
       )
@@ -950,9 +1108,105 @@ export class GhidraClient {
       );
     }
     if (deadline.signal.aborted) return this.#startupInterrupted(deadline);
+    if (this.#checkpoint !== undefined && packedProgram === undefined) {
+      try {
+        await this.#saveCheckpoint(true, deadline.signal);
+      } catch (cause: unknown) {
+        return this.#startupFailure(
+          deadline.signal.aborted
+            ? this.#interruptionFailure(deadline, cause)
+            : this.#failure(
+                "checkpoint",
+                "Initial Ghidra checkpoint could not be saved; check REA_GHIDRA_CHECKPOINT_DIR and reopen the target",
+                cause,
+              ),
+          deadline,
+        );
+      }
+    }
     this.#startupOutputCheckpoint = undefined;
     this.#requestQueue.reopen();
     return completed;
+  }
+
+  /** Save once at startup and after changes, retaining a failed publication for retry. */
+  async #saveCheckpoint(force: boolean, signal?: AbortSignal): Promise<void> {
+    const owner = this.#checkpoint;
+    const runtime = this.#runtimeRoot;
+    if (owner === undefined || runtime === undefined) return;
+    await this.#finishCheckpointStaging(signal);
+    const path = join(runtime.path, `checkpoint-${randomUUID()}.gzf`);
+    const saved = await this.#wire.request(
+      "checkpoint_program",
+      { path, force },
+      signal === undefined ? {} : { signal },
+    );
+    if (!saved.ok) {
+      if (saved.error.kind === "remote")
+        return this.#discardCheckpoint(path, saved.error, signal);
+      throw saved.error;
+    }
+    const parsed = z
+      .discriminatedUnion("saved", [
+        z.object({ saved: z.literal(false) }).strict(),
+        z.object({ saved: z.literal(true), path: z.literal(path) }).strict(),
+      ])
+      .safeParse(saved.value);
+    if (!parsed.success)
+      return this.#discardCheckpoint(
+        path,
+        this.#failure(
+          "protocol",
+          "Ghidra checkpoint acknowledgement is invalid",
+          parsed.error,
+        ),
+        signal,
+      );
+    if (!parsed.data.saved) return;
+    this.#checkpointStaging = { path, disposition: "publish" };
+    await this.#finishCheckpointStaging(signal);
+  }
+
+  /** An acknowledged failed export is owned but is not a valid checkpoint. */
+  async #discardCheckpoint(
+    path: string,
+    failure: GhidraSessionError,
+    signal?: AbortSignal,
+  ): Promise<never> {
+    this.#checkpointStaging = { path, disposition: "discard" };
+    try {
+      await this.#finishCheckpointStaging(signal);
+    } catch (cause: unknown) {
+      const cleanup = this.#retainCleanupFailure(
+        new ProviderCleanupError(
+          "ghidra",
+          [path],
+          {
+            reason:
+              "A failed Ghidra checkpoint export left a partial file; close the target to retry its cleanup before another save.",
+            diagnostics: this.#diagnostics(),
+          },
+          { cause },
+        ),
+      );
+      throw failure.withCleanupFailure(cleanup);
+    }
+    throw failure;
+  }
+
+  async #finishCheckpointStaging(signal?: AbortSignal): Promise<void> {
+    const staged = this.#checkpointStaging;
+    if (staged === undefined) return;
+    if (staged.disposition === "publish") {
+      if (this.#checkpoint === undefined)
+        throw this.#failure(
+          "protocol",
+          "Checkpoint publication owner is missing",
+        );
+      await this.#checkpoint.publish(staged.path, signal);
+    }
+    await rm(staged.path, { force: true });
+    this.#checkpointStaging = undefined;
   }
 
   async #connectAndHandshake(
@@ -969,7 +1223,7 @@ export class GhidraClient {
           this.#wire.request(method, params, requestOptions),
         parseSessionInfo: (value) => this.#parseSessionInfo(value),
         failure: this.#failure,
-        startupTimeoutMs: this.#options.startupTimeoutMs,
+        startupTimeoutMs: deadline.timeoutMs,
       });
       if (
         completed.ok ||
@@ -1000,7 +1254,7 @@ export class GhidraClient {
       failure: this.#failure,
       isClosed: () => this.#closing,
       processExited: () => this.#process?.observedExit() !== undefined,
-      startupTimeoutMs: this.#options.startupTimeoutMs,
+      startupTimeoutMs: deadline.timeoutMs,
       handlers: {
         data: this.#onSocketData,
         error: this.#onSocketError,
@@ -1020,7 +1274,9 @@ export class GhidraClient {
     const parsed = parseGhidraSessionInfo(value, {
       runId,
       expectedReadOnly:
+        this.#options.existingProject === true ||
         this.#options.transport === "authenticated-loopback-tcp",
+      expectedExistingProject: this.#options.existingProject === true,
       providerVersion: this.#options.providerVersion,
       profileDigest: this.#options.profileDigest,
       targetSha256: this.#options.targetSha256,
@@ -1053,7 +1309,11 @@ export class GhidraClient {
       await starting?.promise.catch(() => undefined);
       await this.#cleanup(forceStop);
     } finally {
-      if (this.#startupAttempt === starting) this.#startupAttempt = undefined;
+      if (
+        this.#startupAttempt === starting &&
+        (forceStop || this.#socket === undefined || this.#socket.destroyed)
+      )
+        this.#startupAttempt = undefined;
       this.#closePromise = undefined;
     }
   }
@@ -1065,6 +1325,20 @@ export class GhidraClient {
       this.#requestQueue.failQueued(
         this.#failure("process", "Ghidra session closed"),
       );
+      if (
+        !forceStop &&
+        this.#startupSucceeded() &&
+        this.#checkpoint !== undefined &&
+        this.#socket !== undefined &&
+        !this.#socket.destroyed
+      ) {
+        try {
+          await this.#saveCheckpoint(false);
+        } catch (cause: unknown) {
+          this.#requestQueue.reopen();
+          throw cause;
+        }
+      }
       const socket = this.#socket;
       if (!forceStop && socket !== undefined && !socket.destroyed) {
         const shutdown = await this.#wire
@@ -1119,6 +1393,7 @@ export class GhidraClient {
       this.#lastDiagnostics = this.#diagnostics();
       this.#process = undefined;
       this.#launch = undefined;
+      await this.#checkpoint?.close();
       await this.#fileResources.retryCleanup();
       try {
         await this.#removeRuntimeRoots();
@@ -1127,6 +1402,8 @@ export class GhidraClient {
         else throw cause;
       }
       this.#snapshotPath = undefined;
+      this.#checkpointStaging = undefined;
+      this.#checkpointRestore = undefined;
       this.#endpointPath = undefined;
       this.#token = undefined;
       this.#runId = undefined;
@@ -1269,7 +1546,17 @@ export class GhidraClient {
         });
   }
 
-  #diagnostics(): Readonly<Record<string, JsonValue>> {
+  #diagnostics(
+    requestedScope: GhidraDiagnosticsScope = "session",
+  ): Readonly<Record<string, JsonValue>> {
+    // Startup errors still need launcher evidence. A request projection must
+    // have both a completed handshake and its own active output checkpoint.
+    const scope =
+      requestedScope === "request" &&
+      this.#startupSucceeded() &&
+      this.#activeOutputCheckpoint !== undefined
+        ? "request"
+        : "session";
     const currentSnapshot = this.#process?.snapshot() ?? this.#processSnapshot;
     const snapshot: ProviderProcessSnapshot | undefined =
       this.#outputDrainIncomplete && currentSnapshot !== undefined
@@ -1280,7 +1567,9 @@ export class GhidraClient {
           }
         : currentSnapshot;
     const checkpoint =
-      this.#activeOutputCheckpoint ?? this.#startupOutputCheckpoint;
+      scope === "request"
+        ? this.#activeOutputCheckpoint
+        : (this.#activeOutputCheckpoint ?? this.#startupOutputCheckpoint);
     const scoped =
       checkpoint === undefined
         ? undefined
@@ -1289,31 +1578,39 @@ export class GhidraClient {
       scoped === undefined
         ? undefined
         : ghidraFailureOutput(scoped, this.#token, this.#outputDrainIncomplete);
-    return createGhidraDiagnostics({
-      targetPath: this.#options.targetPath,
-      targetSha256: this.#options.targetSha256,
-      ...(this.#targetAdmission === undefined
+    return {
+      ...createGhidraDiagnostics({
+        scope,
+        targetPath: this.#options.targetPath,
+        targetSha256: this.#options.targetSha256,
+        ...(this.#targetAdmission === undefined
+          ? {}
+          : { targetAdmission: this.#targetAdmission }),
+        transport: this.#options.transport,
+        providerVersion: this.#options.providerVersion,
+        profileDigest: this.#options.profileDigest,
+        ...(this.#runId === undefined ? {} : { runId: this.#runId }),
+        ...(this.#runtimeRoot === undefined
+          ? {}
+          : { runtimeRoot: this.#runtimeRoot.path }),
+        ...(this.#socketRoot === undefined
+          ? {}
+          : { socketRoot: this.#socketRoot.path }),
+        ...(this.#endpointPath === undefined
+          ? {}
+          : { endpointPath: this.#endpointPath }),
+        ...(this.#launch === undefined ? {} : { launch: this.#launch }),
+        ...(snapshot === undefined ? {} : { snapshot }),
+        ...(this.#token === undefined ? {} : { token: this.#token }),
+        previous: this.#lastDiagnostics,
+        ...(failureOutput === undefined
+          ? {}
+          : { failure_output: failureOutput }),
+      }),
+      ...(this.#checkpoint === undefined
         ? {}
-        : { targetAdmission: this.#targetAdmission }),
-      transport: this.#options.transport,
-      providerVersion: this.#options.providerVersion,
-      profileDigest: this.#options.profileDigest,
-      ...(this.#runId === undefined ? {} : { runId: this.#runId }),
-      ...(this.#runtimeRoot === undefined
-        ? {}
-        : { runtimeRoot: this.#runtimeRoot.path }),
-      ...(this.#socketRoot === undefined
-        ? {}
-        : { socketRoot: this.#socketRoot.path }),
-      ...(this.#endpointPath === undefined
-        ? {}
-        : { endpointPath: this.#endpointPath }),
-      ...(this.#launch === undefined ? {} : { launch: this.#launch }),
-      ...(snapshot === undefined ? {} : { snapshot }),
-      ...(this.#token === undefined ? {} : { token: this.#token }),
-      previous: this.#lastDiagnostics,
-      ...(failureOutput === undefined ? {} : { failure_output: failureOutput }),
-    });
+        : { checkpoint: this.#checkpoint.observation }),
+    };
   }
 
   #refreshProcessFailure(

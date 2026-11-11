@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { machoWithPropertyAttributes } from "../../tests/fixtures/objcPropertyMacho.js";
 import { objcRecordBudgetMacho } from "../../tests/fixtures/objcRecordBudgetMacho.js";
-import { decodeAppleDispatchMetadata } from "./AppleDispatchMetadata.js";
+import { decodeAppleDispatchMetadata } from "./AppleDispatchMetadata.fixture.js";
 
 const base = 0x100000000n;
 const fixture = (
@@ -307,6 +307,7 @@ const swiftExternalSwiftBindingImage = (
     ...Buffer.from(
       `${boundField === "protocol" ? "_$sSQMp" : boundField === "objc-class" ? "_OBJC_CLASS_$_NSObject" : "_$sSiMn"}\0`,
     ),
+    0x51, // SET_TYPE_IMM pointer
     0x70,
     0x80,
     0x16, // SET_SEGMENT_AND_OFFSET_ULEB segment 0 + offset 0xb00
@@ -336,8 +337,13 @@ const swiftExternalSwiftBindingImage = (
   bytes.writeBigUInt64LE(0n, 0xb00); // Bound slot has no in-image pointer.
   bytes.writeUInt32LE(16, 0xc00);
   bytes.writeInt32LE(0x1f8, 0xc08);
+  bytes.writeInt32LE(0xc40 - 0xc04, 0xc04);
+  bytes.writeUInt32LE(0, 0xc40);
+  bytes.writeInt32LE(0xe40 - 0xc48, 0xc48);
+  bytes.write("FixtureModule\0", 0xe40);
   if (boundField !== "protocol") {
     bytes.writeUInt32LE(3, 0xd00);
+    bytes.writeInt32LE(0xc40 - 0xd04, 0xd04);
     bytes.writeInt32LE(0xf8, 0xd08);
     bytes.write("Equatable\0", 0xe00);
   } else {
@@ -368,6 +374,7 @@ const swiftBoundWitnessSlotImage = () => {
     0x11,
     0x40,
     ...Buffer.from("_externalWitnessImpl\0"),
+    0x51, // SET_TYPE_IMM pointer
     0x70,
     0x88,
     0x1c, // SET_SEGMENT_AND_OFFSET_ULEB segment 0 + witness slot 0xe08
@@ -399,6 +406,7 @@ const swiftBoundWitnessSlotImage = () => {
   bytes.writeInt32LE(0xec0 - 0xc48, 0xc48);
   bytes.write("FixtureModule\0", 0xec0);
   bytes.writeUInt32LE(3, 0xd00);
+  bytes.writeInt32LE(0xc40 - 0xd04, 0xd04);
   bytes.writeInt32LE(0x148, 0xd08);
   bytes.writeUInt32LE(0, 0xd0c);
   bytes.writeUInt32LE(1, 0xd10);
@@ -740,6 +748,10 @@ describe("Swift conformance type-reference kinds", () => {
       bytes.writeInt32LE(0xdc, 0x224); // Indirect class cell at 0x300.
       bytes.writeUInt32LE(3 << 3, 0x22c);
       bytes.writeUInt32LE(3, 0x260); // Protocol context descriptor.
+      bytes.writeInt32LE(0x320 - 0x264, 0x264); // Parent module context.
+      bytes.writeUInt32LE(0, 0x320);
+      bytes.writeInt32LE(0x340 - 0x328, 0x328);
+      bytes.write("FixtureModule\0", 0x340);
       bytes.writeInt32LE(0x18, 0x268);
       bytes.write("FixtureProtocol\0", 0x280);
       bytes.writeBigUInt64LE(target, 0x300);
@@ -756,8 +768,9 @@ describe("Swift conformance type-reference kinds", () => {
           witness_table: { address: null, file_offset: null },
           decode: {
             status: "partial",
-            reason:
-              "Indirect Objective-C class metadata requires runtime lookup",
+            reason: expect.stringMatching(
+              /indirect Objective-C class metadata.*runtime lookup/i,
+            ),
           },
         },
       ]);
@@ -1096,6 +1109,7 @@ describe("Apple dispatch pointer fixup metadata", () => {
       const bindings = Buffer.from([
         0x40,
         ...Buffer.from("_OBJC_CLASS_$_NSObject\0"),
+        0x51, // SET_TYPE_IMM pointer
         0x70,
         0x88,
         0x04,
@@ -1416,6 +1430,65 @@ describe("Apple dispatch coverage ownership", () => {
   });
 });
 
+describe("Objective-C category class references without a class name", () => {
+  const categoryCoverage = (bytes: Buffer) => {
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_categories).toMatchObject([
+      {
+        name: "FixtureCategory",
+        class_name: null,
+        class_source: "unresolved",
+        decode: { status: "partial", reason: "category_class_unresolved" },
+      },
+    ]);
+    return result.coverage.find(
+      ({ facet }) => facet === "objc_properties_categories",
+    );
+  };
+
+  it("names a class reference bound to a Swift class metadata symbol", () => {
+    // swiftc emits a category for @objc members of another module's Swift
+    // class and binds its class field to `_$s…CN`, not `_OBJC_CLASS_$_`.
+    const bytes = fixture(false, "unmapped-class");
+    bytes.writeBigUInt64LE(0n, 0xb48);
+    // LC_DYLD_INFO_ONLY after the segment command binds the class field.
+    bytes.writeUInt32LE(2, 16);
+    bytes.writeUInt32LE(280, 20);
+    bytes.writeUInt32LE(0x80000022, 264);
+    bytes.writeUInt32LE(48, 268);
+    const bindings = Buffer.from([
+      0x40,
+      ...Buffer.from("_$s4Main3FooCN\0"),
+      0x51, // SET_TYPE_IMM pointer
+      0x70,
+      0xc8,
+      0x16,
+      0x90,
+      0x00,
+    ]);
+    bindings.copy(bytes, 0xc00);
+    bytes.writeUInt32LE(0xc00, 280);
+    bytes.writeUInt32LE(bindings.length, 284);
+    expect(categoryCoverage(bytes)).toMatchObject({
+      status: "partial",
+      reason: expect.stringMatching(
+        /category_class_unresolved.*0x100000b48.*FixtureCategory.*_\$s4Main3FooCN.*not read as an Objective-C class name/iu,
+      ),
+    });
+  });
+
+  it("explains a null class reference", () => {
+    const bytes = fixture(false, "unmapped-class");
+    bytes.writeBigUInt64LE(0n, 0xb48);
+    expect(categoryCoverage(bytes)).toMatchObject({
+      status: "partial",
+      reason: expect.stringMatching(
+        /category_class_unresolved.*0x100000b48.*FixtureCategory.*class reference is null/i,
+      ),
+    });
+  });
+});
+
 describe("Objective-C declaration-local record-budget coverage", () => {
   it.each(["protocol", "class"] as const)(
     "preserves the decoded $0 method at a sufficient budget",
@@ -1584,6 +1657,42 @@ describe("Objective-C category-local record-budget coverage", () => {
 });
 
 describe("malformed Objective-C property records", () => {
+  it.each(["class", "category"] as const)(
+    "retains the %s identity when its property-list pointer field is unmapped",
+    (owner) => {
+      const bytes = fixture(false, "partial-method");
+      if (owner === "class") {
+        bytes.writeBigUInt64LE(base + 0xfc0n, 0x220);
+        bytes.writeUInt32LE(2, 0xfc0);
+        bytes.writeUInt32LE(16, 0xfc8);
+        bytes.writeBigUInt64LE(base + 0x450n, 0xfd8);
+      } else {
+        bytes.writeBigUInt64LE(base + 0xfd8n, 0xb00);
+        bytes.writeBigUInt64LE(base + 0xbc0n, 0xfd8);
+        bytes.writeBigUInt64LE(base + 0x200n, 0xfe0);
+      }
+      const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+      if (owner === "class")
+        expect(result.objc_classes).toContainEqual(
+          expect.objectContaining({ name: "Fixture", is_meta_class: false }),
+        );
+      else
+        expect(result.objc_categories).toMatchObject([
+          { name: "FixtureCategory", class_name: "Fixture", properties: [] },
+        ]);
+      expect(
+        result.coverage.find(
+          ({ facet }) => facet === "objc_properties_categories",
+        ),
+      ).toMatchObject({
+        status: "partial",
+        reason: expect.stringContaining(
+          "property_decode_failed at 0x100001000",
+        ),
+      });
+    },
+  );
+
   it.each([
     ["an unmapped name", { secondNameOffset: 0x2000 }, "first", "0x100000518"],
     ["an empty name", { firstName: "" }, "second", "0x100000508"],
@@ -2378,4 +2487,178 @@ it("retains the enclosing Swift type and module in a conformance owner", () => {
     decode: { status: "decoded" },
   });
   expect(result.swift_dispatch_slots[0]?.owner).toBe("Outer.Widget: Equatable");
+});
+
+it.each([false, true])(
+  "preserves a nested protocol identity and reports unread parent context (%s)",
+  (unreadParent) => {
+    const bytes = swiftBoundWitnessSlotImage();
+    // This identity regression uses a local executable witness, not an import.
+    bytes.writeUInt32LE(0, 280);
+    bytes.writeUInt32LE(0, 284);
+    bytes.writeBigUInt64LE(base + 0xb00n, 0xe08);
+    bytes.writeInt32LE(0xc20 - 0xd04, 0xd04);
+    bytes.writeUInt32LE(17, 0xc20);
+    bytes.writeInt32LE((unreadParent ? 0x5000 : 0xc40) - 0xc24, 0xc24);
+    bytes.writeInt32LE(0xea0 - 0xc28, 0xc28);
+    bytes.write("Outer\0", 0xea0);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.swift_conformances[0]).toMatchObject({
+      type_name: "Widget",
+      protocol_name: unreadParent ? "Equatable" : "Outer.Equatable",
+      module: "FixtureModule",
+      decode: { status: unreadParent ? "partial" : "decoded" },
+    });
+    expect(result.swift_dispatch_slots[0]).toMatchObject({
+      owner: unreadParent ? "Widget: Equatable" : "Widget: Outer.Equatable",
+      implementation_address: "0x100000b00",
+      decode: { status: "decoded" },
+    });
+    expect(
+      result.coverage.find(
+        ({ facet }) => facet === "swift_conformances_static_witness_slots",
+      )?.status,
+    ).toBe(unreadParent ? "partial" : "complete");
+  },
+);
+
+describe("Objective-C adopted protocol-list count limit", () => {
+  // Root class and metaclass that adopt the fixture protocol through the
+  // class_ro_t base protocol list at 0x700.
+  const rootClass = (protocolCount: bigint, category?: "partial-method") => {
+    const bytes = fixture(false, category);
+    bytes.writeUInt32LE(2, 12);
+    bytes.writeUInt32LE(5, 88);
+    bytes.writeUInt32LE(2, 0x300);
+    bytes.writeUInt32LE(3, 0x380);
+    bytes.writeBigUInt64LE(protocolCount, 0x700);
+    return bytes;
+  };
+  const classCoverage = (
+    result: ReturnType<typeof decodeAppleDispatchMetadata>,
+  ) =>
+    result.coverage.find(
+      ({ facet }) => facet === "objc_class_method_ivar_metadata",
+    );
+
+  it("retains the class and metaclass rows when the list exceeds its count limit", () => {
+    const result = decodeAppleDispatchMetadata(
+      rootClass(20001n),
+      100,
+      provenance,
+    );
+    expect(
+      result.objc_classes.map(({ name, is_meta_class, protocols, decode }) => ({
+        name,
+        is_meta_class,
+        protocols,
+        decode,
+      })),
+    ).toEqual([
+      {
+        name: "Fixture",
+        is_meta_class: false,
+        protocols: [],
+        decode: { status: "partial", reason: "protocol_list_unreadable" },
+      },
+      // The metaclass has no adopted-protocol list of its own.
+      {
+        name: "Fixture",
+        is_meta_class: true,
+        protocols: [],
+        decode: { status: "decoded", reason: null },
+      },
+    ]);
+    expect(result.objc_classes[0]?.properties).toHaveLength(3);
+    expect(result.objc_ivars).toHaveLength(1);
+    expect(result.objc_dispatch_implementations).toMatchObject([
+      { class_name: "Fixture", selector: "performAction:" },
+    ]);
+    expect(classCoverage(result)).toMatchObject({
+      status: "partial",
+      // The class row is retained as partial, so it is examined but not
+      // counted as fully decoded; the metaclass is fully decoded.
+      examined: 2,
+      decoded: 1,
+    });
+  });
+
+  it("retains the readable protocol prefix when a later list slot is unmapped", () => {
+    const bytes = rootClass(2n);
+    bytes.writeBigUInt64LE(base + 0x5000n, 0x710);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_classes).toMatchObject([
+      {
+        name: "Fixture",
+        protocols: ["FixtureProtocol"],
+        decode: { status: "partial", reason: "protocol_list_unreadable" },
+      },
+      { name: "Fixture", is_meta_class: true },
+    ]);
+    expect(result.objc_protocol_records).toMatchObject([
+      { name: "FixtureProtocol", decode: { status: "decoded" } },
+    ]);
+  });
+
+  it("retains a category's own methods and properties after a protocol-list refusal", () => {
+    const bytes = rootClass(0n, "partial-method");
+    bytes.writeBigUInt64LE(base + 0x700n, 0xb98);
+    bytes.writeBigUInt64LE(base + 0x600n, 0xb68);
+    bytes.writeBigUInt64LE(base + 0xa00n, 0xb60);
+    bytes.writeBigUInt64LE(20001n, 0xa00);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_categories).toMatchObject([
+      {
+        name: "FixtureCategory",
+        class_name: "Fixture",
+        instance_methods: ["performAction:"],
+        protocols: [],
+        decode: { status: "partial", reason: "protocol_list_unreadable" },
+      },
+    ]);
+    expect(result.objc_categories[0]?.properties).toHaveLength(3);
+    expect(classCoverage(result)?.status).toBe("complete");
+    expect(
+      result.coverage.find(
+        ({ facet }) => facet === "objc_properties_categories",
+      ),
+    ).toMatchObject({ status: "partial" });
+  });
+
+  it("retains an adopting protocol's own method declarations after a list refusal", () => {
+    const bytes = rootClass(1n);
+    bytes.writeBigUInt64LE(base + 0xa00n, 0x750);
+    bytes.writeBigUInt64LE(20001n, 0xa00);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_protocol_records).toMatchObject([
+      {
+        name: "FixtureProtocol",
+        adopted_protocols: [],
+        methods: [{ selector: "requiredAction:" }],
+        optional_methods: [{ selector: "optionalAction:" }],
+        decode: { status: "partial", reason: "protocol_list_unreadable" },
+      },
+    ]);
+    expect(result.objc_protocols).toMatchObject([
+      { name: "FixtureProtocol", methods: [{ selector: "requiredAction:" }] },
+    ]);
+    expect(result.objc_classes).toHaveLength(2);
+    expect(classCoverage(result)?.status).toBe("partial");
+  });
+
+  it.each([0n, 1n])(
+    "keeps complete class coverage for an in-limit count of %s",
+    (count) => {
+      const bytes = rootClass(count);
+      const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+      const reason = classCoverage(result)?.reason ?? "";
+      expect(reason).not.toContain("Protocol list of Fixture");
+      expect(result.objc_classes).toHaveLength(2);
+      for (const row of result.objc_classes)
+        expect(row.decode?.reason ?? "").not.toContain(
+          "protocol_list_unreadable",
+        );
+      expect(classCoverage(result)?.status).toBe("complete");
+    },
+  );
 });

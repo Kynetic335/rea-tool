@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 import { realpath, stat } from "node:fs/promises";
 import { findAppBundleResourceRoot } from "../application/AppBundleExecutable.js";
@@ -18,7 +19,10 @@ import {
   snapshotSelectionOption,
 } from "./options.js";
 import type { CliInstance } from "./types.js";
-import { runCliJavaScriptApplicationAnalysis } from "./javascriptApplicationAnalysis.js";
+import {
+  cliJavaScriptSourcePaths,
+  runCliJavaScriptApplicationAnalysis,
+} from "./javascriptApplicationAnalysis.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import {
   analysisEvidenceDeliveryOptions,
@@ -29,8 +33,10 @@ import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { javascriptApplicationOptions } from "../cliObservationOptions.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { localPathStringSchema } from "../domain/localPath.js";
+import type { ExecutableFormatHint } from "../domain/dosCom.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { registerDecompileDirectoryCommand } from "./decompileDirectoryCommand.js";
+import { decompileAnalysisSelection } from "../contracts/officialToolContracts.js";
 
 const decompileSelectorGuidance = `${addressOrProcedureGuidance} Alternatively, use --file-offset alone.`;
 const namedAddressGuidance = requiredSelectorGuidance(
@@ -98,6 +104,7 @@ const registerOverviewCommands = (
     options: overviewOptions.extend({
       integrityPolicy: laneIntegrityPolicy,
       sourcePath: javascriptApplicationOptions.shape.sourcePath,
+      sourcePathsJson: javascriptApplicationOptions.shape.sourcePathsJson,
     }),
     run: async ({ args, options }) => {
       // Route JavaScript targets exactly like analyze-javascript-application,
@@ -105,23 +112,32 @@ const registerOverviewCommands = (
       // code is not replaced by the logged failure status.
       if (await routesToJavaScriptAnalysis(args.path, options))
         return withCommandCancellation((signal) =>
-          logCliCommand(logger, "analyze", () =>
-            runCliJavaScriptApplicationAnalysis(
+          logCliCommand(logger, "analyze", async () => {
+            const sourcePaths = await cliJavaScriptSourcePaths(
+              options.sourcePath,
+              options.sourcePathsJson,
+              signal,
+            );
+            if (!sourcePaths.ok) return sourcePaths.error;
+            return runCliJavaScriptApplicationAnalysis(
               {
                 input_path: absoluteCallerPath(args.path),
                 integrity_policy:
                   options.integrityPolicy ?? defaultIntegrityPolicy,
-                ...(options.sourcePath === undefined
+                ...(sourcePaths.value === undefined
                   ? {}
-                  : { source_paths: options.sourcePath }),
+                  : { source_paths: sourcePaths.value }),
               },
               environment,
               signal,
-            ),
-          ),
+            );
+          }),
         );
       return logCliCommand(logger, "analyze", () => {
-        if (options.sourcePath !== undefined)
+        if (
+          options.sourcePath !== undefined ||
+          options.sourcePathsJson !== undefined
+        )
           throw new AnalysisInputError(
             "analyze_javascript_application",
             undefined,
@@ -152,14 +168,16 @@ const registerOverviewCommands = (
           "binary_overview",
           {},
           directAnalysisOptionsFromCli(logger, options),
-        );
+        ).then(projectCliAnalysisResult);
       });
     },
   });
   cli.command(CLI_COMMANDS.inspect, {
     description: "Inspect an app overview with evidence",
     args: z.object({
-      path: z.string().describe("App, program, or analysis database path"),
+      path: localPathStringSchema.describe(
+        "App, program, or analysis database path",
+      ),
     }),
     options: overviewOptions,
     run: ({ args, options }) =>
@@ -169,7 +187,7 @@ const registerOverviewCommands = (
           "binary_overview",
           {},
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -180,9 +198,9 @@ const registerDecompileCommand = (
   runDirectAnalysis: DirectAnalysis["runDirectAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.decompile, {
-    description: `Read one part of an app as code. ${decompileSelectorGuidance} Equal positional and --procedure values are accepted; conflicts fail.`,
+    description: `Read one part of an app as code. ${decompileSelectorGuidance} Equal positional and --procedure values are accepted; conflicts fail. With Ghidra, a space-qualified address such as ram:0x... avoids file-offset fallback; inspect-native-load-image reports the observed default space.`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -204,6 +222,7 @@ const registerDecompileCommand = (
         .describe(
           `Ghidra source-file byte offset; mapped internally to an analysis address. ${decompileSelectorGuidance}`,
         ),
+      analysis: decompileAnalysisSelection,
       snapshot: snapshotSelectionOption,
       ...nativeOpenOptionFields,
     }),
@@ -227,10 +246,14 @@ const registerDecompileCommand = (
                 ? "procedure"
                 : "file-offset",
               "procedure_pseudo_code",
+              "native",
             ),
+            ...(options.analysis === undefined
+              ? {}
+              : { analysis: options.analysis }),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -240,7 +263,7 @@ const routesToJavaScriptAnalysis = async (
   path: string,
   options: {
     readonly snapshot?: string | undefined;
-    readonly "target-format"?: "dos-com" | "raw-binary" | undefined;
+    readonly "target-format"?: ExecutableFormatHint | undefined;
     readonly architecture?: string | undefined;
     readonly "entry-point"?: string | undefined;
     readonly provider?: string | undefined;
@@ -273,9 +296,9 @@ const registerXrefsCommand = (
   runDirectAnalysis: DirectAnalysis["runDirectAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.xrefs, {
-    description: `List bounded references to an analyzed address. ${namedAddressGuidance} ${equalSelectorGuidance}`,
+    description: `List bounded, untyped references to an analyzed address. For typed incoming references, use inspect-native-instruction at the target address where supported. ${namedAddressGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -304,10 +327,11 @@ const registerXrefsCommand = (
               options.address,
               "address",
               "xrefs",
+              "native",
             ),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -320,7 +344,7 @@ const registerTraceCommand = (
   cli.command(CLI_COMMANDS.trace, {
     description: `Trace a literal feature through analyzed references. ${querySelectorGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       query: z
         .string()
         .min(1)
@@ -340,24 +364,41 @@ const registerTraceCommand = (
         .default(false)
         .describe("Match the query with exact letter case"),
       snapshot: snapshotSelectionOption,
+      ...analysisEvidenceDeliveryOptions,
       ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
-      logCliCommand(logger, "trace", () =>
-        runDirectAnalysis(
-          args.path,
-          "trace_feature",
-          {
-            query: resolveCliAnalysisSelector(
-              args.query,
-              options.query,
-              "query",
-              "trace_feature",
-            ),
-            case_sensitive: options.caseSensitive,
-          },
-          directAnalysisOptionsFromCli(logger, options),
-        ),
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "trace", async () => {
+          const delivery = {
+            providerId: "auto",
+            operation: "trace_feature",
+            signal,
+            detail: options.detail,
+            evidenceOutput: options.evidence_output,
+          };
+          const inputError = cliEvidenceDeliveryInputError(delivery);
+          if (inputError !== undefined) return projectAnalysisError(inputError);
+          const complete = await runDirectAnalysis(
+            args.path,
+            "trace_feature",
+            {
+              query: resolveCliAnalysisSelector(
+                args.query,
+                options.query,
+                "query",
+                "trace_feature",
+              ),
+              case_sensitive: options.caseSensitive,
+            },
+            {
+              ...directAnalysisOptionsFromCli(logger, options),
+              signal,
+              includeEvidenceSources: options.evidence_output !== undefined,
+            },
+          );
+          return publishCliAnalysisEvidence(complete, delivery);
+        }),
       ),
   });
 };
@@ -370,7 +411,7 @@ const registerFunctionCommand = (
   cli.command(CLI_COMMANDS.function, {
     description: `Analyze one complete function with evidence. ${addressOrProcedureGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -411,9 +452,14 @@ const registerFunctionCommand = (
                 options.procedure,
                 "procedure",
                 "analyze_function",
+                "native",
               ),
             },
-            { ...directAnalysisOptionsFromCli(logger, options), signal },
+            {
+              ...directAnalysisOptionsFromCli(logger, options),
+              signal,
+              includeEvidenceSources: options.evidence_output !== undefined,
+            },
           );
           return publishCliAnalysisEvidence(complete, delivery);
         }),
@@ -429,7 +475,7 @@ const registerInstructionsCommand = (
   cli.command(CLI_COMMANDS.instructions, {
     description: `Read every raw instruction without decompiling. ${addressOrProcedureGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -458,10 +504,11 @@ const registerInstructionsCommand = (
               options.procedure,
               "procedure",
               "read_function_instructions",
+              "native",
             ),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -474,7 +521,7 @@ const registerSearchCommand = (
   cli.command(CLI_COMMANDS.search, {
     description: `Search every analyzed string or procedure name. ${patternSelectorGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       pattern: z
         .string()
         .min(1)
@@ -522,7 +569,7 @@ const registerSearchCommand = (
             case_sensitive: options.caseSensitive,
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };

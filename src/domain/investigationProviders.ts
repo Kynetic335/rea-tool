@@ -33,10 +33,64 @@ export const PE_CERTIFICATES_PROVIDER = Object.freeze({
   version: "1",
 } as const);
 
+/** Provider identity for portable, execution-free PE import-table decoding. */
+export const PE_IMPORTS_PROVIDER = Object.freeze({
+  id: "rea-pe-imports",
+  name: "REA PE import parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable, execution-free Shell Link decoding. */
+export const WINDOWS_SHORTCUT_PROVIDER = Object.freeze({
+  id: "rea-windows-shortcut",
+  name: "REA Windows shortcut parser",
+  version: "1",
+} as const);
+
 /** Provider identity for portable, execution-free ELF note-table decoding. */
+export const DEVICETREE_PROVIDER = Object.freeze({
+  id: "rea-devicetree",
+  name: "REA flattened devicetree parser",
+  version: "1",
+} as const);
+
 export const ELF_NOTES_PROVIDER = Object.freeze({
   id: "rea-elf-notes",
   name: "REA ELF note parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable, execution-free ELF unwind-table decoding. */
+export const ELF_UNWIND_RANGES_PROVIDER = Object.freeze({
+  id: "rea-elf-unwind-ranges",
+  name: "REA ELF unwind range parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable, execution-free Apple .ips crash-report decoding. */
+export const APPLE_IPS_PROVIDER = Object.freeze({
+  id: "rea-apple-ips",
+  name: "REA Apple IPS parser",
+  version: "1",
+} as const);
+/** Provider identity for portable, execution-free Linux kernel-module metadata. */
+export const KERNEL_MODULE_PROVIDER = Object.freeze({
+  id: "rea-kernel-module",
+  name: "REA kernel module parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable, execution-free ELF and Mach-O initializer and finalizer tables. */
+export const NATIVE_INITIALIZERS_PROVIDER = Object.freeze({
+  id: "rea-native-initializers",
+  name: "REA ELF and Mach-O initializer parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable, execution-free Linux kernel banner and IKCONFIG decoding. */
+export const KERNEL_BUILD_CONFIG_PROVIDER = Object.freeze({
+  id: "rea-kernel-build-config",
+  name: "REA kernel build config parser",
   version: "1",
 } as const);
 
@@ -151,3 +205,16 @@ export const RECONSTRUCTION_PROVIDER = {
   name: "REA reconstruction verifier",
   version: "1",
 } as const;
+
+export const PE_LOAD_CONFIG_PROVIDER = Object.freeze({
+  id: "rea-pe-load-config",
+  name: "REA PE TLS/load-config parser",
+  version: "1",
+} as const);
+
+/** Provider identity for portable ELF, PE, and Mach-O hardening inspection. */
+export const BINARY_HARDENING_PROVIDER = Object.freeze({
+  id: "rea-binary-hardening",
+  name: "REA binary hardening parser",
+  version: "1",
+} as const);

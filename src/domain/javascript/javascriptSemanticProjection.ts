@@ -12,14 +12,15 @@ import {
   type JavaScriptSemanticAnalysisState,
   type JavaScriptSemanticScopeState,
 } from "./javascriptSemanticState.js";
-import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
+import { semanticRequireOriginCandidate } from "./javascriptSemanticRequireOrigin.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import {
   completeSemanticSteps,
-  traverseJavaScriptAstSteps,
+  traverseJavaScriptValueAstSteps,
 } from "./javascriptSemanticTraversal.js";
 import {
   evaluateSemanticBinding,
+  evaluateSemanticExpression,
   evaluateSemanticProvenance,
 } from "./javascriptSemanticValues.js";
 import { range } from "./javascriptStaticAnalysisHelpers.js";
@@ -32,6 +33,7 @@ import {
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
+  isErasedJavaScriptDeclaration,
   isTypeOnlyExportDeclaration,
   isTypeOnlyExportSpecifier,
   isTypeOnlyImportDeclaration,
@@ -45,7 +47,7 @@ import {
   type CommonJsExportSite,
 } from "./javascriptCommonJsExportReceivers.js";
 import type { JavaScriptSemanticPropertyPath } from "./javascriptSemanticPropertyPaths.js";
-import { semanticComputedMethodKey } from "./javascriptSemanticEvaluationOrder.js";
+import { semanticMethodDefinitionExpression } from "./javascriptSemanticEvaluationOrder.js";
 
 interface CollectCallableInput {
   readonly node: t.Node;
@@ -75,7 +77,7 @@ export const collectSemanticCallable = (input: CollectCallableInput): void => {
     computedKeyLocation:
       "key" in node &&
       t.isNode(node.key) &&
-      semanticComputedMethodKey(node, node.key)
+      semanticMethodDefinitionExpression(node, node.key)
         ? range(node.key)
         : null,
     returnSites: [],
@@ -97,6 +99,16 @@ export const collectSemanticModuleLink = (
     CommonJsExportReceiverEffect
   >,
 ): void => {
+  // Import/export declarations also describe erased type links. Their nested
+  // expressions do not establish runtime require or CommonJS export links.
+  if (
+    state.erasedSyntaxNodes.has(node) &&
+    !t.isTSImportEqualsDeclaration(node) &&
+    !t.isImportDeclaration(node) &&
+    !t.isExportNamedDeclaration(node) &&
+    !t.isExportAllDeclaration(node)
+  )
+    return;
   if (t.isTSImportEqualsDeclaration(node)) collectImportEquals(node, state);
   else if (t.isImportDeclaration(node)) collectImports(node, state);
   else if (t.isExportAllDeclaration(node))
@@ -117,7 +129,9 @@ export const collectSemanticModuleLink = (
     addModuleLink(
       state,
       {
-        kind: "export",
+        kind: isErasedJavaScriptDeclaration(node.declaration)
+          ? "type-import"
+          : "export",
         specifier: null,
         importedName: null,
         localName: defaultExportLocalName(node.declaration),
@@ -179,7 +193,7 @@ export function* collectSemanticReferencesSteps(
 ): Generator<void, JavaScriptSemanticReference[]> {
   const output: JavaScriptSemanticReference[] = [];
   const seen = new Set<string>();
-  yield* traverseJavaScriptAstSteps(program, {
+  yield* traverseJavaScriptValueAstSteps(program, state.erasedSyntaxNodes, {
     enter: (node, parent, readAncestors) => {
       if (
         !t.isIdentifier(node) ||
@@ -255,6 +269,17 @@ export const immutableSemanticBindings = (
       mutable: binding.mutable,
       definitions: binding.definitions,
       value: evaluateSemanticBinding(binding, state),
+      ...(binding.memberWrites.length > 0 &&
+      binding.initializers.length === 1 &&
+      binding.initializers[0]?.projection.length === 0
+        ? {
+            initializerValue: evaluateSemanticExpression(
+              binding.initializers[0].node,
+              state,
+              binding.initializers[0].node,
+            ),
+          }
+        : {}),
       provenance: evaluateSemanticProvenance(binding, state),
     }))
     .sort((left, right) =>
@@ -403,7 +428,7 @@ const collectRequireLink = (
   node: t.VariableDeclarator,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
-  const required = semanticRequireOrigin(node.init, state);
+  const required = semanticRequireOriginCandidate(node.init, state);
   if (required === undefined) return;
   const { origin, call } = required;
   const bindings = requirePatternBindings(node.id, origin.importedPath);
@@ -412,6 +437,9 @@ const collectRequireLink = (
       state,
       {
         kind: "require",
+        ...(origin.loaderAuthority === "candidate"
+          ? { loaderAuthority: "candidate" as const }
+          : {}),
         specifier: origin.specifier,
         importedName: binding.importedName,
         localName: binding.localName,
@@ -428,12 +456,15 @@ const collectUnboundRequireLink = (
   state: JavaScriptSemanticAnalysisState,
 ): void => {
   if (state.linkedRequireCalls.has(node)) return;
-  const required = semanticRequireOrigin(node, state);
+  const required = semanticRequireOriginCandidate(node, state);
   if (required === undefined) return;
   addModuleLink(
     state,
     {
       kind: "require",
+      ...(required.origin.loaderAuthority === "candidate"
+        ? { loaderAuthority: "candidate" as const }
+        : {}),
       specifier: required.origin.specifier,
       importedName: null,
       localName: null,
@@ -490,6 +521,7 @@ const collectCommonJsExport = (
       exported.exportedName,
       applicability === "uncertain" ? null : exported.value,
       exported.projection,
+      exported.loaderAuthority,
     );
   }
 };
@@ -500,13 +532,14 @@ const addCommonJsExport = (
   exportedName: string,
   exported: t.Node | null,
   projection?: JavaScriptSemanticPropertyPath,
+  loaderAuthority?: "candidate",
 ): void => {
   // Simple assignment chains yield their rightmost assigned value.
   let value = exported;
   while (t.isAssignmentExpression(value, { operator: "=" }))
     value = value.right;
   const required =
-    value === null ? undefined : semanticRequireOrigin(value, state);
+    value === null ? undefined : semanticRequireOriginCandidate(value, state);
   // Copies retain their module provenance, but do not export the source object
   // itself. A wildcard with exclusions cannot express one module link.
   const origin = projection?.some(
@@ -520,6 +553,10 @@ const addCommonJsExport = (
     state,
     {
       kind: "commonjs-export",
+      ...(origin?.loaderAuthority === "candidate" ||
+      loaderAuthority === "candidate"
+        ? { loaderAuthority: "candidate" as const }
+        : {}),
       specifier: origin?.specifier ?? null,
       importedName:
         origin === undefined

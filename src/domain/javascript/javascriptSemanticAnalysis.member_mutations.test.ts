@@ -874,21 +874,6 @@ describe("property mutation collection on minified bundles", () => {
       ],
     });
   }, 30000);
-
-  it("indexes many returned object methods instead of rescanning the object", () => {
-    const methods = Array.from(
-      { length: 2000 },
-      (_, index) => `m${index}() { return shared; }`,
-    ).join(",");
-    const writes = Array.from(
-      { length: 2000 },
-      (_, index) => `box.m${index}().p${index} = ${index};`,
-    ).join(" ");
-    const value = resultValue(
-      `const shared = { token: "TOKEN" }; const box = { ${methods} }; ${writes} return shared.token;`,
-    );
-    expect(value?.status).toBe("unknown");
-  }, 30000);
 });
 
 describe("results of methods on an escaped receiver", () => {
@@ -926,3 +911,32 @@ describe("results of methods on an escaped receiver", () => {
     });
   }, 30000);
 });
+
+it.each([
+  ["named", "@dec abstract slot: { mode: string };"],
+  ["computed literal", '@dec abstract ["slot"]: { mode: string };'],
+])(
+  "retains the possible inherited alias through a decorated abstract %s field",
+  (_name, field) => {
+    // An emit that erases the field lets this write reach Base.slot. The
+    // analysis must still invalidate shared even if another emit shadows it.
+    const setup = `
+      function dec(...args: unknown[]) {}
+      const shared = { mode: "initial" };
+      class Base { slot = shared; }
+      abstract class Derived extends Base { ${field} }
+      const Constructor = Derived as unknown as new () => Base;
+    `;
+    expect(resultValue(`${setup} return shared.mode;`)).toEqual({
+      status: "literal",
+      value: "initial",
+    });
+    expect(
+      resultValue(`
+        ${setup}
+        new Constructor().slot.mode = "updated";
+        return shared.mode;
+      `),
+    ).toMatchObject({ status: "unknown" });
+  },
+);

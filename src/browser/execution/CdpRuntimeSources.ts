@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { z } from "zod";
+import { webTextFacts } from "../../domain/webContentArtifact.js";
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
 import { sanitizeBrowserUrl } from "../../domain/browserObservation.js";
@@ -13,7 +13,9 @@ import type { CdpRuntimeSession } from "./CdpRuntimeSession.js";
 import {
   runtimeContextSchema,
   runtimeScriptParsedSchema,
-} from "./CdpRuntimeProtocol.js";
+  cdpContextFrameClaim,
+  selectCdpScriptFrame,
+} from "../CdpScriptContextFacts.js";
 import { assertRuntimeRetention } from "./CdpRuntimeRetention.js";
 
 const scriptIdentitySchema = runtimeScriptParsedSchema.pick({ scriptId: true });
@@ -136,13 +138,14 @@ export class CdpRuntimeSources {
       )
     )
       return false;
-    const reported = scriptContext?.frameId;
-    const contextFrame = context?.frameId;
+    const frame = selectCdpScriptFrame(
+      cdpContextFrameClaim(scriptContext),
+      cdpContextFrameClaim(context),
+    );
     return (
-      (reported === undefined ||
-        contextFrame === undefined ||
-        reported === contextFrame) &&
-      (reported ?? contextFrame) === this.session.target.frame_id
+      !frame.invalid &&
+      !frame.conflicting &&
+      frame.frameId === this.session.target.frame_id
     );
   }
 
@@ -267,19 +270,19 @@ export class CdpRuntimeSources {
         "Debugger.getScriptSource returned malformed source text.",
       );
     const text = source.data.scriptSource;
-    const bytes = Buffer.byteLength(text);
-    this.#sourceBytes += bytes;
+    this.#sourceBytes += Buffer.byteLength(text);
     assertRuntimeRetention(
       this.session.operation,
       "sources",
       this.#sourceBytes,
     );
+    const facts = webTextFacts(text);
     return {
       state: "captured",
       text,
-      sha256: createHash("sha256").update(text).digest("hex"),
-      utf8_bytes: bytes,
-      utf16_units: text.length,
+      sha256: facts.sha256,
+      utf8_bytes: facts.utf8Bytes,
+      utf16_units: facts.utf16Units,
     };
   }
 }

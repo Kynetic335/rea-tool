@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { lstat, open, type FileHandle } from "node:fs/promises";
-import { sameRegularFileState } from "../filesystem/RegularFile.js";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
+import {
+  resolvedRegularFile,
+  sameRegularFileState,
+} from "../filesystem/RegularFile.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import type { ArtifactResourceScope } from "./ArtifactResourceScope.js";
 import {
   artifactFileCompletion,
+  artifactSelectedPathErrno,
   withArtifactFileHandle,
   assertArtifactReadActive,
 } from "./ArtifactFileOperation.js";
@@ -37,11 +41,13 @@ export const completedStableArtifact = (
 export interface StableArtifactFileSystem {
   lstat(path: string): Promise<BigIntStats>;
   open(path: string, flags: number): Promise<FileHandle>;
+  realpath?(path: string): Promise<string>;
 }
 
 const FILE_SYSTEM: StableArtifactFileSystem = {
   lstat: (path) => lstat(path, { bigint: true }),
   open,
+  realpath,
 };
 
 const afterValidation = async <T>(
@@ -52,11 +58,7 @@ const afterValidation = async <T>(
   try {
     return await read();
   } catch (cause) {
-    if (
-      cause instanceof Error &&
-      "code" in cause &&
-      ["ENOENT", "ENOTDIR", "ELOOP"].includes(String(cause.code))
-    )
+    if (artifactSelectedPathErrno(cause) !== undefined)
       throw new ArtifactReaderFailure(
         "integrity",
         `Artifact changed ${stage}: ${path}`,
@@ -66,13 +68,18 @@ const afterValidation = async <T>(
   }
 };
 
-/** Read one bounded regular file and reject replacement or in-place changes. */
+/**
+ * Read one bounded regular file and reject replacement or in-place changes.
+ * The optional observer receives verified state before descriptor finalization;
+ * callers may reuse it only after this promise resolves successfully.
+ */
 export const readStableArtifact = async (
   path: string,
   maximumBytes: number,
   signal?: AbortSignal,
   fileSystem: StableArtifactFileSystem = FILE_SYSTEM,
   resourceScope?: ArtifactResourceScope,
+  onValidatedState?: (state: BigIntStats) => void,
 ): Promise<StableArtifactSnapshot> => {
   assertArtifactReadActive(signal);
   const before = await fileSystem.lstat(path);
@@ -80,8 +87,12 @@ export const readStableArtifact = async (
     throw new ArtifactReaderFailure(
       "path",
       `Expected a regular file without a symlink: ${path}`,
+      before.isSymbolicLink()
+        ? { resolvedPath: await resolvedRegularFile(path, fileSystem) }
+        : {},
     );
-  if (before.size > BigInt(maximumBytes))
+  const maximumSize = BigInt(maximumBytes);
+  if (before.size > maximumSize)
     throw new ArtifactReaderFailure(
       "limit",
       `Selected artifact exceeds ${String(maximumBytes)} bytes: ${path}`,
@@ -109,28 +120,46 @@ export const readStableArtifact = async (
           "integrity",
           `Artifact changed before open: ${path}`,
         );
-      const chunks: Buffer[] = [];
+      assertArtifactReadActive(signal);
+      // A raced descriptor size must not allocate beyond the selected budget.
+      // These private bytes are published only after the exact count and both
+      // file identities below validate, so an incomplete read exposes no tail.
+      const bytes = Buffer.allocUnsafe(
+        Number(initial.size > maximumSize ? maximumSize : initial.size),
+      );
+      const overflow = Buffer.allocUnsafe(65536);
+      const hash = createHash("sha256");
       let count = 0;
-      for await (const chunk of file.createReadStream({
-        autoClose: false,
-        highWaterMark: 65536,
-      })) {
+      for (;;) {
         assertArtifactReadActive(signal);
-        const value: unknown = chunk;
-        if (!Buffer.isBuffer(value))
+        const inside = count < bytes.length;
+        const target = inside ? bytes : overflow;
+        const offset = inside ? count : 0;
+        const wanted = Math.min(65536, target.length - offset);
+        const { bytesRead } = await file.read(target, offset, wanted, count);
+        // EOF still passes through the original final metadata/cancellation
+        // checks. A rejected physical read remains primary over cancellation.
+        if (bytesRead === 0) break;
+        assertArtifactReadActive(signal);
+        if (
+          !Number.isSafeInteger(bytesRead) ||
+          bytesRead < 0 ||
+          bytesRead > wanted
+        )
           throw new ArtifactReaderFailure(
             "format",
-            `Artifact stream did not return bytes: ${path}`,
+            `Artifact descriptor returned an invalid byte count: ${path}`,
           );
-        const bytes = value;
-        count += bytes.length;
+        count += bytesRead;
         if (count > maximumBytes)
           throw new ArtifactReaderFailure(
             "limit",
             `Selected artifact grew beyond its byte limit: ${path}`,
             { boundary: "file-size" },
           );
-        chunks.push(bytes);
+        // Read growth into bounded scratch space while preserving physical
+        // read failures and byte-budget refusal ahead of final integrity checks.
+        hash.update(target.subarray(offset, offset + bytesRead));
       }
       const after = await file.stat({ bigint: true });
       const current = await afterValidation(path, "during read", () =>
@@ -145,11 +174,29 @@ export const readStableArtifact = async (
           `Artifact changed during read: ${path}`,
         );
       assertArtifactReadActive(signal);
-      const bytes = Buffer.concat(chunks, count);
+      onValidatedState?.(initial);
       return {
         bytes,
-        sha256: createHash("sha256").update(bytes).digest("hex"),
+        sha256: hash.digest("hex"),
       };
     },
   );
+};
+
+/** Revalidate a completed snapshot's selected file state without reading its bytes again. */
+export const assertStableArtifactState = async (
+  path: string,
+  expected: BigIntStats,
+  signal?: AbortSignal,
+): Promise<void> => {
+  assertArtifactReadActive(signal);
+  const current = await afterValidation(path, "before cached inspection", () =>
+    lstat(path, { bigint: true }),
+  );
+  if (!sameRegularFileState(expected, current))
+    throw new ArtifactReaderFailure(
+      "integrity",
+      `Artifact changed since acquisition: ${path}`,
+    );
+  assertArtifactReadActive(signal);
 };

@@ -17,22 +17,21 @@ import {
   STATIC_ROUTE_CALL_NAMES,
   stringValue,
 } from "./javascriptStaticAnalysisHelpers.js";
-import { traverseJavaScriptAstSteps } from "./javascriptSemanticTraversal.js";
+import { traverseJavaScriptValueAstSteps } from "./javascriptSemanticTraversal.js";
 import {
   semanticStableInitializer,
   type JavaScriptBindingIndex,
   type JavaScriptSemanticBindingState,
 } from "./javascriptSemanticState.js";
-import {
-  semanticCopiedReferencePath,
-  semanticReferenceSourcesInactive,
-} from "./javascriptSemanticReferenceSources.js";
+import { semanticReferenceSourcesInactive } from "./javascriptSemanticReferenceSources.js";
+import { semanticCopiedReferencePath } from "./javascriptSemanticCopiedReferencePaths.js";
 import {
   semanticAliasSelectionChoices,
   type SemanticAliasSelectionPath,
 } from "./javascriptSemanticAliasSelections.js";
 import { semanticProjectedSourcesAtRead } from "./javascriptSemanticProjectedSources.js";
 import { semanticBindingAtRead } from "./javascriptSemanticMutationInitializers.js";
+import { javaScriptRuntimeContext } from "./javascriptSourceParser.js";
 import {
   semanticObjectPropertyReferences,
   semanticArrayPropertyReferences,
@@ -52,6 +51,16 @@ const range = (node: t.Node): JavaScriptRouteSegment["location"] => {
 };
 
 type Mechanism = JavaScriptRouteCandidate["mechanism"];
+/**
+ * A source value plus the identifier whose runtime identity stays unproven.
+ * A program-scope `var` in a script without a proven isolated runtime is a
+ * global-object property, so a write through `globalThis` or an alias can
+ * replace it. Consumers degrade from this shared fact; none opts in to it.
+ */
+interface RouteValueProof {
+  readonly node: t.Node;
+  readonly unproven: t.Identifier | undefined;
+}
 type LegacyRoute = {
   node: t.Node;
   value: string;
@@ -241,6 +250,7 @@ export class JavaScriptRouteScan {
       readonly value: t.Node | undefined;
       readonly pathname: t.Node | undefined;
       readonly occurrence: t.Node | undefined;
+      readonly unproven: t.Identifier | undefined;
     }
   >();
   readonly #automaticRoots = new Map<t.ObjectExpression, boolean>();
@@ -312,27 +322,33 @@ export class JavaScriptRouteScan {
         return;
       if (this.#queue(node)) requests.push({ node, site });
     };
-    yield* traverseJavaScriptAstSteps(root, {
-      skip: () => this.#result.capacity !== null,
-      enter: (node) => {
-        if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
-          const parts = calleeName(node.callee).split(".");
-          if (navigationRecognition(parts.at(-1)!, parts.at(-2) ?? "") !== true)
-            return;
-          const first = node.arguments[0];
-          if (
-            first !== undefined &&
-            !t.isSpreadElement(first) &&
-            !t.isArgumentPlaceholder(first)
+    yield* traverseJavaScriptValueAstSteps(
+      root,
+      this.index.bindings.erasedSyntaxNodes,
+      {
+        skip: () => this.#result.capacity !== null,
+        enter: (node) => {
+          if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
+            const parts = calleeName(node.callee).split(".");
+            if (
+              navigationRecognition(parts.at(-1)!, parts.at(-2) ?? "") !== true
+            )
+              return;
+            const first = node.arguments[0];
+            if (
+              first !== undefined &&
+              !t.isSpreadElement(first) &&
+              !t.isArgumentPlaceholder(first)
+            )
+              remember(first, node);
+          } else if (
+            t.isObjectProperty(node) &&
+            semanticStaticPropertyName(node.key, node.computed) === "href"
           )
-            remember(first, node);
-        } else if (
-          t.isObjectProperty(node) &&
-          semanticStaticPropertyName(node.key, node.computed) === "href"
-        )
-          remember(node.value, node);
+            remember(node.value, node);
+        },
       },
-    });
+    );
     if (requests.length === 0 || this.#result.capacity !== null) return;
     yield* this.index.indexMemberMutationFactsSteps();
     for (const { node, site } of requests) {
@@ -340,21 +356,27 @@ export class JavaScriptRouteScan {
       if (this.#result.capacity !== null) return;
       const value = this.#resolve(node, site, this.index);
       const field =
-        value !== undefined && t.isObjectExpression(value)
-          ? this.#fields(value).values.get("pathname")?.value
+        value !== undefined && t.isObjectExpression(value.node)
+          ? this.#fields(value.node).values.get("pathname")?.value
           : undefined;
       const pathname =
         field === undefined
           ? undefined
           : this.#resolve(field, site, this.index);
+      // A replaced destination cannot establish a complete navigation path, so
+      // both the object and its selected `pathname` share the same degrade.
+      const unproven = value?.unproven ?? pathname?.unproven;
       this.#navigationValues.set(node, {
-        value,
-        pathname,
+        value: unproven === undefined ? value?.node : undefined,
+        pathname: unproven === undefined ? pathname?.node : undefined,
+        unproven,
         occurrence:
-          value !== unwrapJavaScriptExpression(node).node
+          value !== undefined &&
+          value.node !== unwrapJavaScriptExpression(node).node
             ? node
             : field !== undefined &&
-                pathname !== unwrapJavaScriptExpression(field).node
+                pathname !== undefined &&
+                pathname.node !== unwrapJavaScriptExpression(field).node
               ? field
               : undefined,
       });
@@ -384,87 +406,93 @@ export class JavaScriptRouteScan {
         structured: true,
         reported: true,
       };
-      yield* traverseJavaScriptAstSteps(value, {
-        skip: (node) =>
-          this.#result.capacity !== null ||
-          isRouteValueBoundary(node, true) ||
-          seen.has(node),
-        enter: (node, parent) => {
-          if (node !== value) {
-            if (!this.#queue(node)) return;
-            seen.add(node);
-          }
-          this.#dynamicValues.set(node, owner);
-          let overwritten = false;
-          if (
-            t.isObjectProperty(node) &&
-            !isObjectPrototypeSetter(node) &&
-            t.isObjectExpression(parent)
-          ) {
-            const key = semanticStaticPropertyKey(node.key, node.computed);
-            if (key !== null) {
-              const fields = this.#fields(parent);
-              const effective = fields.values.get(key);
-              // Unknown spreads/keys may preserve earlier data. Only a known
-              // final slot or method proves that this reference was discarded.
-              overwritten =
-                fields.dynamicNames.has(key) ||
-                (effective !== undefined && effective !== node);
+      yield* traverseJavaScriptValueAstSteps(
+        value,
+        this.index.bindings.erasedSyntaxNodes,
+        {
+          skip: (node) =>
+            this.#result.capacity !== null ||
+            isRouteValueBoundary(node, true) ||
+            seen.has(node),
+          enter: (node, parent) => {
+            if (node !== value) {
+              if (!this.#queue(node)) return;
+              seen.add(node);
             }
-          }
-          const nonValue =
-            overwritten ||
-            t.isTSType(node) ||
-            !isNavigationDataEdge(node, parent) ||
-            (parent !== null && nonValueReferences.has(parent));
-          if (nonValue) nonValueReferences.add(node);
-          if (
-            !nonValue &&
-            (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
-          ) {
-            for (const selected of this.#memberValues(node)) admit(selected);
-          }
-          if (
-            nonValue ||
-            !t.isIdentifier(node) ||
-            (parent !== null && !t.isReferenced(node, parent))
-          )
-            return;
-          const declared = this.index.bindingForReferenceAt(node);
-          if (declared === undefined) return;
-          for (const sources of [
-            declared.initializers,
-            declared.referenceInitializers,
-          ])
-            for (const source of sources) if (!this.#queue(source.node)) return;
-          // Different reads may select different values; unresolved order
-          // retains its possible sources instead of becoming absence.
-          const binding = semanticBindingAtRead(
-            declared,
-            node,
-            this.index.bindings.parentsByNode,
-          ).binding;
-          for (const initializers of [
-            binding.initializers,
-            binding.referenceInitializers,
-          ])
-            for (const initializer of initializers) {
-              if (
-                semanticReferenceSourcesInactive(
-                  initializer,
-                  this.index.bindings,
+            this.#dynamicValues.set(node, owner);
+            let overwritten = false;
+            if (
+              t.isObjectProperty(node) &&
+              !isObjectPrototypeSetter(node) &&
+              t.isObjectExpression(parent)
+            ) {
+              const key = semanticStaticPropertyKey(node.key, node.computed);
+              if (key !== null) {
+                const fields = this.#fields(parent);
+                const effective = fields.values.get(key);
+                // Unknown spreads/keys may preserve earlier data. Only a known
+                // final slot or method proves that this reference was discarded.
+                overwritten =
+                  fields.dynamicNames.has(key) ||
+                  (effective !== undefined && effective !== node);
+              }
+            }
+            const nonValue =
+              overwritten ||
+              t.isTSType(node) ||
+              !isNavigationDataEdge(node, parent) ||
+              (parent !== null && nonValueReferences.has(parent));
+            if (nonValue) nonValueReferences.add(node);
+            if (
+              !nonValue &&
+              (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
+            ) {
+              for (const selected of this.#memberValues(node)) admit(selected);
+            }
+            if (
+              nonValue ||
+              !t.isIdentifier(node) ||
+              (parent !== null && !t.isReferenced(node, parent))
+            )
+              return;
+            const declared = this.index.bindingForReferenceAt(node);
+            if (declared === undefined) return;
+            for (const sources of [
+              declared.initializers,
+              declared.referenceInitializers,
+            ])
+              for (const source of sources)
+                if (!this.#queue(source.node)) return;
+            // Different reads may select different values; unresolved order
+            // retains its possible sources instead of becoming absence.
+            const binding = semanticBindingAtRead(
+              declared,
+              node,
+              this.index.bindings,
+            ).binding;
+            for (const initializers of [
+              binding.initializers,
+              binding.referenceInitializers,
+            ])
+              for (const initializer of initializers) {
+                if (
+                  semanticReferenceSourcesInactive(
+                    initializer,
+                    this.index.bindings,
+                  )
                 )
-              )
-                continue;
-              for (const selected of this.#initializerValues(initializer))
-                admit(selected);
-            }
+                  continue;
+                for (const selected of this.#initializerValues(initializer))
+                  admit(selected);
+              }
+          },
         },
-      });
+      );
     }
   }
 
   inspect(node: t.Node, parent: t.Node | null): void {
+    if (this.index.bindings.erasedSyntaxNodes.has(node)) return;
     const expressionParent =
       parent === null ? null : (this.#expressionParents.get(parent) ?? parent);
     if (
@@ -642,7 +670,9 @@ export class JavaScriptRouteScan {
     else if (recognized === false) {
       // Method spelling alone does not make array/string data a destination.
       const value = this.#resolve(first, undefined, this.index);
-      if (value !== undefined) this.#propertyValues.add(value);
+      // Ownership of a property value does not assert its runtime identity, so
+      // the source node stays registered even when the proof is unisolated.
+      if (value !== undefined) this.#propertyValues.add(value.node);
     }
     if (name === "addRoute" && node.arguments.length === 2) {
       // This overload can name a parent rather than a URL. Resolve its record
@@ -756,7 +786,11 @@ export class JavaScriptRouteScan {
       }
       if (call.namedParent === true) {
         const record = this.#resolve(first, call.node, index);
-        if (record !== undefined && t.isFunction(record)) {
+        if (
+          record !== undefined &&
+          record.unproven === undefined &&
+          t.isFunction(record.node)
+        ) {
           this.#registeredPath(call.node.arguments[0]!);
         } else {
           this.#claimConfiguration(first, index, false);
@@ -819,11 +853,7 @@ export class JavaScriptRouteScan {
       // Decide generic-constant admission only after all specific owners finish.
       if (this.#propertyValues.has(literal.node)) continue;
       const path = routePath(literal.value, { navigation: true });
-      if (
-        path === undefined ||
-        /^\/(?:_next|api|assets|static)(?:\/|$)/u.test(path)
-      )
-        continue;
+      if (path === undefined) continue;
       // These remain inferred candidates. The inventory owner additionally binds them to app roots across sources.
       if (this.#nextRuntime || roots.has(path.split("/")[1]!))
         this.#emit(
@@ -851,8 +881,15 @@ export class JavaScriptRouteScan {
         seen = new Set<t.Node>();
       while (pending.length > 0 && this.#result.capacity === null) {
         yield;
-        const raw = pending.pop()!,
-          node = this.#resolve(raw, parent, index);
+        const raw = pending.pop()!;
+        const resolved = this.#resolve(raw, parent, index);
+        // The shared resolver keeps the source value when an unisolated program
+        // variable makes its runtime identity unknown. Route ancestry is
+        // unproven in that case, but the child records are still source-owned:
+        // the literal paths inside them do not need the parent proof, and the
+        // walker already reports the incomplete interpretation. Dropping them
+        // here would lose routes that the previous behaviour reported.
+        const node = resolved?.node;
         if (
           node === undefined ||
           (!t.isArrayExpression(node) && !t.isObjectExpression(node))
@@ -898,6 +935,14 @@ export class JavaScriptRouteScan {
 
   #navigation(node: t.Node): void {
     const prepared = this.#navigationValues.get(node);
+    if (prepared?.unproven !== undefined) {
+      this.#unknown(
+        "navigation-target",
+        node,
+        "The navigation destination is an unisolated program variable, so a runtime replacement cannot be excluded.",
+      );
+      return;
+    }
     const unwrapped =
       prepared === undefined
         ? unwrapJavaScriptExpression(node).node
@@ -1003,20 +1048,30 @@ export class JavaScriptRouteScan {
     node: t.Node,
     site: t.Node | undefined,
     index: JavaScriptBindingIndex,
-  ): t.Node | undefined {
+  ): RouteValueProof | undefined {
     const seen = new Set<t.Node>();
+    let unproven: t.Identifier | undefined;
     for (;;) {
       node = unwrapJavaScriptExpression(node).node;
-      if (!t.isIdentifier(node)) return node;
+      if (!t.isIdentifier(node)) return { node, unproven };
       if (seen.has(node) || !this.#queue(node)) return;
       seen.add(node);
       const binding = index.bindingForReferenceAt(node);
       if (binding === undefined) return;
-      const read = semanticBindingAtRead(
-        binding,
-        node,
-        index.bindings.parentsByNode,
-      );
+      // A program-scope `var` in a script without a proven isolated runtime is
+      // a global-object property, so `globalThis.NAME` or an alias can replace
+      // it. Mark the value unproven at the shared resolver: every consumer
+      // degrades from the same fact, instead of each one opting in. The source
+      // initializer is still followed so a container consumer can keep source
+      // facts and disclose the gap instead of dropping them.
+      if (
+        unproven === undefined &&
+        binding.declarationKinds.has("var") &&
+        index.bindings.scopesById.get(binding.scopeId)?.kind === "program" &&
+        javaScriptRuntimeContext(index.bindings.program) === "unknown"
+      )
+        unproven = node;
+      const read = semanticBindingAtRead(binding, node, index.bindings);
       if (!read.hasDefiniteInitializer) return;
       const initializer = semanticStableInitializer(
         read.binding,
@@ -1128,8 +1183,20 @@ export class JavaScriptRouteScan {
         }
         const selected = this.#resolve(node, undefined, this.index);
         if (selected === undefined) continue;
-        if (!t.isObjectExpression(selected) && !t.isArrayExpression(selected)) {
-          for (const branch of this.#selectionBranches(selected))
+        // A rejected runtime identity does not stop the property selection: the
+        // slot is navigation data and the caller needs its ownership. It only
+        // stops when the selected value would be trusted as a route, which is
+        // every consumer except the navigation-target data walk.
+        if (
+          selected.unproven !== undefined &&
+          mechanism !== "navigation-target"
+        )
+          continue;
+        if (
+          !t.isObjectExpression(selected.node) &&
+          !t.isArrayExpression(selected.node)
+        ) {
+          for (const branch of this.#selectionBranches(selected.node))
             if (
               !this.#retainSelection(pending, branch, projection, depth, target)
             )
@@ -1141,7 +1208,7 @@ export class JavaScriptRouteScan {
           pending.push({
             kind: "lookup",
             node,
-            receiver: selected,
+            receiver: selected.node,
             key,
             projection,
             depth,
@@ -1362,9 +1429,9 @@ export class JavaScriptRouteScan {
     });
     while (frames.length > 0 && this.#result.capacity === null) {
       yield;
-      const frame = frames.pop()!,
-        node = this.#resolve(frame.node, site, index);
-      if (node === undefined) {
+      const frame = frames.pop()!;
+      const proof = this.#resolve(frame.node, site, index);
+      if (proof === undefined) {
         this.#claimConfiguration(frame.node, index, typed, true);
         this.#unknown(
           mechanism,
@@ -1373,6 +1440,16 @@ export class JavaScriptRouteScan {
         );
         continue;
       }
+      // Keep the source route set for a container whose identity is unproven,
+      // and report the incomplete interpretation instead of silently dropping
+      // every child under it.
+      if (proof.unproven !== undefined)
+        this.#unknown(
+          mechanism,
+          frame.node,
+          "The route configuration comes from an unisolated program variable, so a runtime replacement cannot be excluded and this route set may be incomplete.",
+        );
+      const node = proof.node;
       let cyclic = false;
       for (
         let parent = frame.ancestry;
@@ -1444,8 +1521,13 @@ export class JavaScriptRouteScan {
         emit = property !== undefined;
       if (property !== undefined) {
         const literal = this.#resolve(property.value, site, index);
-        if (literal !== undefined) this.#propertyValues.add(literal);
-        const value = literal === undefined ? undefined : stringValue(literal);
+        // A segment read from an unisolated program variable can be replaced at
+        // runtime, so it cannot establish a confident parent segment.
+        const proven = literal?.unproven === undefined ? literal : undefined;
+        // Source ownership survives rejection of the runtime value proof.
+        if (literal !== undefined) this.#propertyValues.add(literal.node);
+        const value =
+          proven === undefined ? undefined : stringValue(proven.node);
         if (
           value === undefined ||
           (value !== "" && routePath(value, { relative: true }) === undefined)
@@ -1462,7 +1544,7 @@ export class JavaScriptRouteScan {
             previous: value.startsWith("/") ? null : link!,
             segment: {
               value,
-              location: range(literal!),
+              location: range(proven!.node),
               origin: "literal",
             },
             inferred: false,
@@ -1486,8 +1568,9 @@ export class JavaScriptRouteScan {
         emit = true;
       } else if (!typed) {
         const flag = own.get("index")?.value;
-        const value =
+        const proof =
           flag === undefined ? undefined : this.#resolve(flag, site, index);
+        const value = proof?.unproven === undefined ? proof?.node : undefined;
         emit = t.isBooleanLiteral(value) && value.value;
         if (flag !== undefined && !t.isBooleanLiteral(value))
           this.#unknown(

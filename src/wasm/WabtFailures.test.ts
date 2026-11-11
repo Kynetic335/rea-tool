@@ -2,8 +2,26 @@ import { expect, it } from "vitest";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { wabtFailure } from "./WabtFailures.js";
-import { WABT_LIMITS } from "./WabtRelease.js";
+import { WASM_RESOURCE_DEFAULTS } from "../domain/wasm/wasmArtifact.js";
 import { OwnedCommandFailure } from "../process/OwnedCommand.js";
+
+it.each(["configuration", "artifact"] as const)(
+  "keeps host allocation failure distinct from %s readiness and byte admission",
+  (phase) => {
+    const cause = Object.assign(new Error("Allocation failed"), {
+      code: "ENOMEM",
+    });
+    const failure = projectAnalysisError(
+      wabtFailure(cause, phase, "/module.wasm"),
+    );
+    expect(failure).toMatchObject({
+      code: "resource_constraint",
+      retryable: false,
+      details: { resource: "memory" },
+    });
+    expect(failure.remediation.action).not.toContain("REA_WABT_BIN_DIRECTORY");
+  },
+);
 
 it.each(["configuration", "producer"] as const)(
   "retains timeout recovery under %s cleanup failure without making cleanup retryable",
@@ -29,16 +47,20 @@ it.each(["configuration", "producer"] as const)(
         diagnostics: {
           previous_error: {
             code: "provider_timeout",
-            details: { timeout_ms: 1234 },
-            recovery: { kind: "inspect_timeout_state", timeout_ms: 1234 },
-            remediation: {
-              action: expect.stringContaining("command_timeout_ms above 1234"),
+            details: {
+              timeout_ms: 1234,
+              limit: {
+                setting: "wasm.command_timeout_ms",
+                effective_value: 1234,
+                rea_restart_required: false,
+              },
             },
+            recovery: { kind: "inspect_timeout_state", timeout_ms: 1234 },
           },
         },
       },
     });
-    expect(projected.remediation.action).not.toContain("Increase");
+    expect(projected.recovery).toBeUndefined();
   },
 );
 
@@ -82,18 +104,22 @@ it.each([1234, 2_147_483_647])(
     );
     expect(projected).toMatchObject({
       code: "provider_timeout",
-      details: { timeout_ms: commandTimeoutMs },
+      details: {
+        timeout_ms: commandTimeoutMs,
+        limit: {
+          setting: "wasm.command_timeout_ms",
+          effective_value: commandTimeoutMs,
+          minimum: 1,
+          maximum: 2_147_483_647,
+          unit: "ms",
+          parameter: "command_timeout_ms",
+          applies_at: "next_operation",
+          agent_editable: true,
+          rea_restart_required: false,
+        },
+      },
       recovery: { kind: "inspect_timeout_state", timeout_ms: commandTimeoutMs },
     });
-    expect(projected.remediation.action).toContain("no server restart");
-    expect(projected.remediation.action).toContain("cleanup");
-    if (commandTimeoutMs === 2_147_483_647) {
-      expect(projected.remediation.action).toContain(
-        "no higher command deadline",
-      );
-      expect(projected.remediation.action).not.toContain("Increase");
-    } else
-      expect(projected.remediation.action).toContain("--command-timeout-ms");
   },
 );
 
@@ -119,6 +145,7 @@ it.each([
       executable_path: "/tools/wasm2wat",
       tool: "wasm2wat",
       expected_version: "1.0.42" as const,
+      accepted_releases: "WABT >=1.0.42 <1.1.0 (verified with 1.0.42)",
     };
     const failure = wabtFailure(cause, "configuration", "/selected.wasm", {
       commandTimeoutMs: 1234,
@@ -163,7 +190,7 @@ it.each([
 );
 
 it.each([false, true])(
-  "preserves the file-size boundary with cleanup=%s when an input exceeds its fixed allowance",
+  "preserves the file-size boundary with cleanup=%s when an input exceeds its allowance",
   (cleanup) => {
     const cause = new ArtifactReaderFailure(
       "limit",
@@ -186,11 +213,13 @@ it.each([false, true])(
       retryable: false,
       details: {
         resource: "file-size",
-        reported_limits: { maximum_input_bytes: WABT_LIMITS.inputBytes },
+        reported_limits: {
+          maximum_input_bytes: WASM_RESOURCE_DEFAULTS.inputBytes,
+        },
       },
     });
     if (!cleanup) {
-      expect(projected.remediation.action).toContain("input byte allowance");
+      expect(projected.remediation.action).toContain("max_input_bytes");
       expect(projected.remediation.action).not.toContain("evidence reply");
     }
     expect(

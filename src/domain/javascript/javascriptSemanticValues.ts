@@ -1,3 +1,4 @@
+import type { JavaScriptSemanticPrecision } from "./javascriptSemanticPrecision.js";
 import {
   semanticBindingMayHaveOpaqueEffect,
   semanticBindingCanBeRebound,
@@ -42,7 +43,7 @@ import {
   type JavaScriptSemanticAnalysisState,
   type JavaScriptSemanticBindingState,
 } from "./javascriptSemanticState.js";
-import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
+import { readSemanticRequireOriginCandidate } from "./javascriptSemanticRequireOriginSlot.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import {
   readExactJavaScriptLiteral,
@@ -61,8 +62,6 @@ import {
   semanticPrimitiveSet as primitiveSet,
 } from "./javascriptSemanticPrimitives.js";
 import {
-  SEMANTIC_EXPRESSION_DEPTH_LIMIT,
-  SEMANTIC_PRIMITIVE_CANDIDATE_LIMIT,
   exceedsSemanticPrimitiveAdditionByteBudget,
   exceedsSemanticTemplateByteBudget,
   semanticResourceLimitUnknown,
@@ -650,18 +649,24 @@ const evaluateExpressionValue = (
   node: t.Node,
   context: EvaluationContext,
 ): JavaScriptSemanticValue => {
-  if (context.expressionDepth > SEMANTIC_EXPRESSION_DEPTH_LIMIT) {
+  if (context.expressionDepth > context.state.precision.expression_depth) {
     context.dependence.lowest = EVERY_CALLER;
-    return semanticResourceLimitUnknown("expression-depth");
+    return semanticResourceLimitUnknown(
+      "expression-depth",
+      context.state.precision,
+    );
   }
   const unwrapped = unwrapJavaScriptExpression(node);
   if (unwrapped.depth > 0) {
     if (
       context.expressionDepth + unwrapped.depth >
-      SEMANTIC_EXPRESSION_DEPTH_LIMIT
+      context.state.precision.expression_depth
     ) {
       context.dependence.lowest = EVERY_CALLER;
-      return semanticResourceLimitUnknown("expression-depth");
+      return semanticResourceLimitUnknown(
+        "expression-depth",
+        context.state.precision,
+      );
     }
     return evaluateExpression(unwrapped.node, {
       ...context,
@@ -669,7 +674,8 @@ const evaluateExpressionValue = (
     });
   }
   const literal = readExactJavaScriptLiteral(node);
-  if (literal.found) return primitiveSet([literal.value]);
+  if (literal.found)
+    return primitiveSet([literal.value], context.state.precision);
   if (
     t.isFunctionExpression(node) ||
     t.isFunctionDeclaration(node) ||
@@ -682,11 +688,7 @@ const evaluateExpressionValue = (
     const binding = resolveSemanticBindingState(context.state, node, node.name);
     if (binding === undefined)
       return { status: "unknown", reason: `Unbound identifier ${node.name}.` };
-    const read = semanticBindingAtRead(
-      binding,
-      node,
-      context.state.parentsByNode,
-    );
+    const read = semanticBindingAtRead(binding, node, context.state);
     if (
       read.status === "unresolved" &&
       binding.mutable &&
@@ -721,9 +723,12 @@ const evaluateExpressionValue = (
   if (t.isTemplateLiteral(node)) return evaluateTemplate(node, context);
   if (t.isConditionalExpression(node) || t.isLogicalExpression(node))
     return mergeValues(
-      semanticSelectedBranches(node, context).map((branch) =>
-        evaluateExpression(branch, nestedContext(context)),
+      semanticSelectedBranches(node, context).map(
+        (branch) =>
+          branch.value ??
+          evaluateExpression(branch.node, nestedContext(context)),
       ),
+      context.state.precision,
     );
   if (t.isObjectExpression(node)) return evaluateObject(node, context);
   if (t.isArrayExpression(node)) return evaluateArray(node, context);
@@ -748,8 +753,17 @@ const evaluateTemplate = (
         status: "unknown",
         reason: "Template text has no cooked representation.",
       };
-    if (exceedsSemanticTemplateByteBudget(candidates, [text]))
-      return semanticResourceLimitUnknown("primitive-bytes");
+    if (
+      exceedsSemanticTemplateByteBudget(
+        candidates,
+        [text],
+        context.state.precision,
+      )
+    )
+      return semanticResourceLimitUnknown(
+        "primitive-bytes",
+        context.state.precision,
+      );
     candidates = candidates.map((prefix) => `${prefix}${text}`);
     const expression = node.expressions[index];
     if (expression === undefined) continue;
@@ -762,39 +776,66 @@ const evaluateTemplate = (
         reason: "Template expression is not a bounded primitive.",
       };
     }
-    if (candidates.length > SEMANTIC_PRIMITIVE_CANDIDATE_LIMIT / values.length)
-      return semanticResourceLimitUnknown("primitive-candidates");
+    if (
+      candidates.length >
+      context.state.precision.primitive_candidates / values.length
+    )
+      return semanticResourceLimitUnknown(
+        "primitive-candidates",
+        context.state.precision,
+      );
     const suffixes = values.map((value) => String(value));
-    if (exceedsSemanticTemplateByteBudget(candidates, suffixes))
-      return semanticResourceLimitUnknown("primitive-bytes");
+    if (
+      exceedsSemanticTemplateByteBudget(
+        candidates,
+        suffixes,
+        context.state.precision,
+      )
+    )
+      return semanticResourceLimitUnknown(
+        "primitive-bytes",
+        context.state.precision,
+      );
     candidates = candidates.flatMap((prefix) =>
       suffixes.map((suffix) => `${prefix}${suffix}`),
     );
   }
-  return primitiveSet(candidates);
+  return primitiveSet(candidates, context.state.precision);
 };
+
+/**
+ * A branch that may produce the expression's value. A logical left operand
+ * carries the value its selection already evaluated, so value consumers reuse
+ * it instead of re-evaluating that operand; re-evaluating it at every level of
+ * a left-nested `a || b || c` chain doubles the work per operand.
+ */
+interface SemanticSelectedBranch {
+  readonly node: t.Node;
+  readonly value?: JavaScriptSemanticValue;
+}
 
 /** Value and provenance selection consume the same established branch facts. */
 const semanticSelectedBranches = (
   node: t.ConditionalExpression | t.LogicalExpression,
   context: EvaluationContext,
-): readonly t.Node[] => {
+): readonly SemanticSelectedBranch[] => {
   if (t.isConditionalExpression(node)) {
     const test = evaluateExpression(node.test, nestedContext(context));
     const choice = semanticCondition(test, Boolean);
     return choice === undefined
-      ? [node.consequent, node.alternate]
-      : [choice ? node.consequent : node.alternate];
+      ? [{ node: node.consequent }, { node: node.alternate }]
+      : [{ node: choice ? node.consequent : node.alternate }];
   }
-  const left = evaluateExpression(node.left, nestedContext(context));
+  const value = evaluateExpression(node.left, nestedContext(context));
+  const left = { node: node.left, value };
   const choice = logicalRightOperand(
     node.operator,
-    semanticCondition(left, Boolean),
-    semanticCondition(left, (value) => value === null, false),
+    semanticCondition(value, Boolean),
+    semanticCondition(value, (candidate) => candidate === null, false),
   );
   return choice === undefined
-    ? [node.left, node.right]
-    : [choice ? node.right : node.left];
+    ? [left, { node: node.right }]
+    : [choice ? { node: node.right } : left];
 };
 
 /** All retained alternatives must agree before discarding a branch. */
@@ -1022,7 +1063,7 @@ const evaluateAddition = (
         current = parent.node.right;
         break;
       }
-      value = addPrimitiveValues(parent.left, value);
+      value = addPrimitiveValues(parent.left, value, context.state.precision);
       pending.pop();
     }
   }
@@ -1031,6 +1072,7 @@ const evaluateAddition = (
 const addPrimitiveValues = (
   leftValue: JavaScriptSemanticValue,
   rightValue: JavaScriptSemanticValue,
+  precision: JavaScriptSemanticPrecision,
 ): JavaScriptSemanticValue => {
   const left = primitiveCandidates(leftValue);
   const right = primitiveCandidates(rightValue);
@@ -1039,10 +1081,10 @@ const addPrimitiveValues = (
     if (isSemanticResourceLimit(rightValue)) return rightValue;
     return { status: "unknown", reason: "Non-primitive addition." };
   }
-  if (left.length > SEMANTIC_PRIMITIVE_CANDIDATE_LIMIT / right.length)
-    return semanticResourceLimitUnknown("primitive-candidates");
-  if (exceedsSemanticPrimitiveAdditionByteBudget(left, right))
-    return semanticResourceLimitUnknown("primitive-bytes");
+  if (left.length > precision.primitive_candidates / right.length)
+    return semanticResourceLimitUnknown("primitive-candidates", precision);
+  if (exceedsSemanticPrimitiveAdditionByteBudget(left, right, precision))
+    return semanticResourceLimitUnknown("primitive-bytes", precision);
   const values = left.flatMap((leftValue) =>
     right.map((rightValue) =>
       typeof leftValue === "string" || typeof rightValue === "string"
@@ -1050,7 +1092,7 @@ const addPrimitiveValues = (
         : Number(leftValue) + Number(rightValue),
     ),
   );
-  return primitiveSet(values);
+  return primitiveSet(values, precision);
 };
 
 const evaluateUnary = (
@@ -1064,11 +1106,20 @@ const evaluateUnary = (
     return { status: "unknown", reason: "Non-primitive unary operand." };
   }
   if (node.operator === "!")
-    return primitiveSet(argument.map((value) => !value));
+    return primitiveSet(
+      argument.map((value) => !value),
+      context.state.precision,
+    );
   if (node.operator === "+")
-    return primitiveSet(argument.map((value) => Number(value)));
+    return primitiveSet(
+      argument.map((value) => Number(value)),
+      context.state.precision,
+    );
   if (node.operator === "-")
-    return primitiveSet(argument.map((value) => -Number(value)));
+    return primitiveSet(
+      argument.map((value) => -Number(value)),
+      context.state.precision,
+    );
   return { status: "unknown", reason: `Unsupported unary ${node.operator}.` };
 };
 
@@ -1192,16 +1243,7 @@ const provenanceForBindingInitializers = (
         : "Catch binding provenance depends on the thrown value.",
     );
   if (binding.directOrigins.length > 0)
-    return binding.kind === "import" &&
-      !binding.runtimeImport &&
-      binding.directOrigins.every(
-        ({ resolutionMode }) => resolutionMode !== "require",
-      )
-      ? semanticAmbiguousProvenance(
-          binding.directOrigins,
-          "A type-only import does not establish a runtime module value.",
-        )
-      : semanticOriginsProvenance(binding.directOrigins);
+    return semanticOriginsProvenance(binding.directOrigins);
   if (binding.initializers.length === 0) return semanticLocalProvenance();
   if (binding.initializers.length > 1)
     return semanticAmbiguousProvenance(
@@ -1229,42 +1271,46 @@ const provenanceForBindingInitializers = (
   } finally {
     context.bindings.delete(binding.bindingId);
   }
-  if (resolved.status !== "module" || initializer.projection.length === 0)
+  if (resolved.origins.length === 0 || initializer.projection.length === 0)
     return resolved;
-  return semanticOriginsProvenance(
-    resolved.origins.map((origin) => ({
-      ...origin,
-      importedPath: [
-        ...origin.importedPath,
-        ...initializer.projection.map((segment) => String(segment)),
-      ],
-    })),
-  );
+  const projected = resolved.origins.map((origin) => ({
+    ...origin,
+    importedPath: [
+      ...origin.importedPath,
+      ...initializer.projection.map((segment) => String(segment)),
+    ],
+  }));
+  return resolved.status === "ambiguous"
+    ? semanticAmbiguousProvenance(projected, resolved.reason)
+    : semanticOriginsProvenance(projected);
 };
 
 const provenanceForExpression = (
   node: t.Node,
   context: EvaluationContext,
 ): JavaScriptBindingProvenance => {
-  if (context.expressionDepth > SEMANTIC_EXPRESSION_DEPTH_LIMIT) {
+  if (context.expressionDepth > context.state.precision.expression_depth) {
     context.dependence.lowest = EVERY_CALLER;
     context.state.valueResourceLimits.add("expression-depth");
     return semanticUnresolvedProvenance(
       "unknown",
-      semanticResourceLimitReason("expression-depth"),
+      semanticResourceLimitReason("expression-depth", context.state.precision),
     );
   }
   const unwrapped = unwrapJavaScriptExpression(node);
   if (unwrapped.depth > 0) {
     if (
       context.expressionDepth + unwrapped.depth >
-      SEMANTIC_EXPRESSION_DEPTH_LIMIT
+      context.state.precision.expression_depth
     ) {
       context.dependence.lowest = EVERY_CALLER;
       context.state.valueResourceLimits.add("expression-depth");
       return semanticUnresolvedProvenance(
         "unknown",
-        semanticResourceLimitReason("expression-depth"),
+        semanticResourceLimitReason(
+          "expression-depth",
+          context.state.precision,
+        ),
       );
     }
     return provenanceForExpression(unwrapped.node, {
@@ -1272,7 +1318,7 @@ const provenanceForExpression = (
       expressionDepth: context.expressionDepth + unwrapped.depth,
     });
   }
-  const required = semanticRequireOrigin(node, context.state);
+  const required = readSemanticRequireOriginCandidate(node, context.state);
   if (required !== undefined)
     return semanticOriginsProvenance([required.origin]);
   if (t.isSequenceExpression(node)) {
@@ -1318,18 +1364,18 @@ const provenanceForExpression = (
     }
     const base = provenanceForExpression(current, nestedContext(context));
     const path = members.reverse();
-    return base.status !== "module"
-      ? base
-      : semanticOriginsProvenance(
-          base.origins.map((origin) => ({
-            ...origin,
-            importedPath: [...origin.importedPath, ...path],
-          })),
-        );
+    if (base.origins.length === 0) return base;
+    const projected = base.origins.map((origin) => ({
+      ...origin,
+      importedPath: [...origin.importedPath, ...path],
+    }));
+    return base.status === "ambiguous"
+      ? semanticAmbiguousProvenance(projected, base.reason)
+      : semanticOriginsProvenance(projected);
   }
   if (t.isConditionalExpression(node) || t.isLogicalExpression(node)) {
     const candidates = semanticSelectedBranches(node, context).map((branch) =>
-      provenanceForExpression(branch, nestedContext(context)),
+      provenanceForExpression(branch.node, nestedContext(context)),
     );
     const origins = uniqueSemanticOrigins(
       candidates.flatMap((candidate) => candidate.origins),
@@ -1372,7 +1418,7 @@ const provenanceForBindingAtRead = (
   const { binding: snapshot } = semanticBindingAtRead(
     binding,
     read,
-    context.state.parentsByNode,
+    context.state,
   );
   if (snapshot === binding) return provenanceForBinding(binding, context);
   if (context.bindings.has(binding.bindingId))
@@ -1404,6 +1450,7 @@ const isLocallyCreatedValue = (node: t.Node): boolean =>
 
 const mergeValues = (
   values: readonly JavaScriptSemanticValue[],
+  precision: JavaScriptSemanticPrecision,
 ): JavaScriptSemanticValue => {
   const resourceLimit = values.find(isSemanticResourceLimit);
   if (resourceLimit !== undefined) return resourceLimit;
@@ -1413,7 +1460,7 @@ const mergeValues = (
   const merged: JavaScriptSemanticValue = values.every(
     (value) => value.status === "union" || value.status === "literal",
   )
-    ? primitiveSet(primitives)
+    ? primitiveSet(primitives, precision)
     : { status: "ambiguous", reason: "Branches have incompatible values." };
   if (values.length > 0 && values.every(semanticValueDefinitelyDefined))
     definitelyDefinedValues.add(merged);

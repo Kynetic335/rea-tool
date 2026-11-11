@@ -38,6 +38,70 @@ it("keeps whole-file identity and entropy while selecting unaligned blocks and a
   expect(result.value.confidence).toBe("observed");
 });
 
+it.each([256, 4096, 65536])(
+  "keeps %i-byte blocks relative to an unaligned window across short physical reads",
+  async (blockSize) => {
+    const root = await createTestTempDirectory("rea-entropy-short-reads-");
+    const path = join(root, "bytes");
+    const bytes = Buffer.from(
+      Array.from({ length: 3 * 65536 + 256 }, (_, i) => i % 256),
+    );
+    await writeFile(path, bytes);
+    let reads = 0;
+    const service = new ByteEntropyService({
+      stat,
+      open: async (...args) => {
+        const file = await open(...args);
+        const read = file.read.bind(file);
+        Object.defineProperty(file, "read", {
+          value: async (
+            buffer: Buffer,
+            offset: number,
+            length: number,
+            position: number,
+          ) => {
+            reads += 1;
+            return read(buffer, offset, Math.min(length, 3571), position);
+          },
+        });
+        return file;
+      },
+    });
+    try {
+      const result = await service.inspect({
+        path,
+        offset: 3,
+        length: 2 * 65536 + 1,
+        block_size: blockSize,
+      });
+      if (!result.ok) throw result.error;
+      const report = byteEntropySchema.parse(result.value.normalized_result);
+      const fullBlocks = (2 * 65536) / blockSize;
+      expect(report.blocks).toEqual([
+        ...Array.from({ length: fullBlocks }, (_, i) => ({
+          offset: 3 + i * blockSize,
+          length: blockSize,
+          entropy: 8,
+        })),
+        { offset: 3 + 2 * 65536, length: 1, entropy: 0 },
+      ]);
+      expect(report.runs).toEqual([
+        { offset: 3, length: 2 * 65536, classification: "high" },
+        { offset: 3 + 2 * 65536, length: 1, classification: "low" },
+      ]);
+      expect(report.file_entropy).toBe(8);
+      expect(report.artifact.sha256).toBe(
+        createHash("sha256").update(bytes).digest("hex"),
+      );
+      // Even with 3,571-byte short reads, finer report resolution does not
+      // require hundreds of asynchronous reads of this 193 KiB file.
+      expect(reads).toBeLessThan(100);
+    } finally {
+      await service.close();
+    }
+  },
+);
+
 it("rejects missing files, non-files and windows beyond EOF, but accepts empty windows", async () => {
   const root = await createTestTempDirectory("rea-entropy-input-");
   const path = join(root, "empty");
@@ -559,3 +623,31 @@ it.each([false, true])(
     expect(result.error.cleanupIncomplete).toBe(false);
   },
 );
+
+it("reads an admitted file even when Windows casing lookup is unavailable", async () => {
+  const root = await createTestTempDirectory("rea-entropy-casing-unavailable-");
+  const path = join(root, "readable.bin");
+  await writeFile(path, Buffer.from([1, 2, 3, 4]));
+  // The injected descriptor represents a readable share while the optional
+  // host spelling lookup has no path on this filesystem.
+  const selected = join(root, "share-selection.bin");
+  const platform = vi
+    .spyOn(process, "platform", "get")
+    .mockReturnValue("win32");
+  const service = new ByteEntropyService({
+    stat: ((...args: Parameters<typeof stat>) =>
+      stat(path, args[1])) as typeof stat,
+    open: async () => open(path, "r"),
+  });
+  try {
+    const result = await service.inspect({ path: selected });
+    if (!result.ok) throw result.error;
+    expect(result.value.normalized_result).toMatchObject({
+      artifact: { bytes: 4 },
+    });
+    expect(result.value.caller_input_path).toBe(selected);
+  } finally {
+    await service.close();
+    platform.mockRestore();
+  }
+});

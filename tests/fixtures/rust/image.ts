@@ -1,4 +1,4 @@
-import { deflateSync } from "node:zlib";
+import { deflateSync, zstdCompressSync } from "node:zlib";
 
 /** zlib payload matching the embedded dependency JSON shape. */
 export const rustDependencyPayload = (
@@ -31,7 +31,8 @@ export const compressRustElfSectionNames = (
   const names = Buffer.from(
     bytes.subarray(namesOffset, namesOffset + namesSize),
   );
-  const compressed = deflateSync(names);
+  const compressed =
+    compressionType === 2 ? zstdCompressSync(names) : deflateSync(names);
   const compressionHeader = Buffer.alloc(24);
   compressionHeader.writeUInt32LE(compressionType, 0);
   compressionHeader.writeBigUInt64LE(BigInt(names.length), 8);
@@ -293,15 +294,14 @@ const writeMachoSegment = ({
 
 /** Read-only ELF data exceeding the distinct rustc-hash retention capacity. */
 export const createRustHashOverflowImage = (): Buffer => {
-  const bytes = createRustImage({ format: "elf", omitSection: true });
-  // Without .dep-v0 the read-only section header is the second one, at 384.
-  // Section names end before byte 800, so the hash block starts there.
-  bytes.writeBigUInt64LE(800n, 384 + 24);
-  bytes.writeBigUInt64LE(3296n, 384 + 32);
-  bytes.fill(0, 800);
+  const bytes = Buffer.alloc(8192);
+  createRustImage({ format: "elf" }).copy(bytes);
+  // Preserve dependency bytes and names; move only the read-only hash section.
+  bytes.writeBigUInt64LE(4096n, 448 + 24);
+  bytes.writeBigUInt64LE(65n * 48n, 448 + 32);
   for (let index = 0; index < 65; index += 1) {
     const hash = index.toString(16).padStart(40, "0");
-    bytes.write(`/rustc/${hash}/`, 800 + index * 48, "latin1");
+    bytes.write(`/rustc/${hash}/`, 4096 + index * 48, "latin1");
   }
   return bytes;
 };
